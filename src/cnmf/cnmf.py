@@ -1234,6 +1234,11 @@ def main():
     """
 
     import sys, argparse
+    try:
+        from cnmf.nmf_gpu import configure_nmf_engine, gpu_kwargs_from_args, parse_gpu_args, validate_engine_args_for_command
+    except ImportError:
+        from nmf_gpu import configure_nmf_engine, gpu_kwargs_from_args, parse_gpu_args, validate_engine_args_for_command
+
     parser = argparse.ArgumentParser()
 
     parser.add_argument('command', type=str, choices=['prepare', 'factorize', 'combine', 'consensus', 'k_selection_plot'])
@@ -1257,11 +1262,18 @@ def main():
     parser.add_argument('--local-neighborhood-size', type=float, help='[consensus] Fraction of the number of replicates to use as nearest neighbors for local density filtering', default=0.30)
     parser.add_argument('--show-clustering', dest='show_clustering', help='[consensus] Produce a clustergram figure summarizing the spectra clustering', action='store_true')
     parser.add_argument('--build-reference', dest='build_reference', help='[consensus] Generates a reference spectra for use in starCAT', action='store_true', default=True)
+    parse_gpu_args(parser)
 
     
     args = parser.parse_args()
+    try:
+        engine_commands = ('factorize',)
+        validate_engine_args_for_command(args, engine_commands)
+    except ValueError as e:
+        parser.error(str(e))
 
     cnmf_obj = cNMF(output_dir=args.output_dir, name=args.name)
+    cnmf_obj = configure_nmf_engine(cnmf_obj, engine=args.engine or 'cpu', gpu_kwargs=gpu_kwargs_from_args(args))
     
     if args.command == 'prepare':
         cnmf_obj.prepare(args.counts, components=args.components, n_iter=args.n_iter, densify=args.densify,

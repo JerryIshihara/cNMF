@@ -69,6 +69,76 @@ DEFAULT_GPU = {
 }
 
 
+def parse_gpu_args(parser):
+    """Register cNMF CLI flags for the optional PyTorch GPU NMF engine."""
+    group = parser.add_argument_group("NMF engine options")
+    group.add_argument("--engine", type=str.lower, choices=["cpu", "gpu"], help="[factorize] NMF engine to use (default cpu)")
+    group.add_argument("--gpu-device", type=str, help="[factorize,gpu] Device for GPU NMF: auto, cpu, cuda, cuda:N, or mps")
+    group.add_argument("--gpu-dtype", type=str.lower, choices=["auto", "fp32", "fp64", "bf16"], help="[factorize,gpu] Storage and matmul dtype for GPU NMF (default auto)")
+    group.add_argument("--gpu-allow-tf32", action="store_const", const=True, help="[factorize,gpu] Allow TF32 for CUDA fp32 matrix multiplication")
+    group.add_argument("--gpu-compile", action="store_const", const=True, help="[factorize,gpu] Enable torch.compile for the GPU NMF update step")
+    group.add_argument("--gpu-eps", type=float, help="[factorize,gpu] Multiplicative-update denominator guard")
+    group.add_argument("--gpu-check-every", type=int, help="[factorize,gpu] Eager-mode convergence check interval")
+    group.add_argument("--gpu-compile-block", type=int, help="[factorize,gpu] Number of MU iterations per compiled block")
+    return parser
+
+
+def gpu_kwargs_from_args(args):
+    """Collect parsed cNMF CLI GPU flags into a kernel gpu_kwargs dict."""
+    raw = {
+        "device": args.gpu_device,
+        "dtype": args.gpu_dtype,
+        "allow_tf32": args.gpu_allow_tf32,
+        "compile": args.gpu_compile,
+        "eps": args.gpu_eps,
+        "check_every": args.gpu_check_every,
+        "compile_block": args.gpu_compile_block,
+    }
+    if args.engine != "gpu":
+        if any(value is not None for value in raw.values()):
+            raise ValueError("GPU options require --engine gpu")
+        return None
+    return _resolve_gpu_opts(raw)
+
+
+def validate_engine_args_for_command(args, available_commands):
+    """Engine/GPU CLI options are only valid for commands that support the selected engine."""
+    available_commands = tuple(available_commands)
+    if args.command in available_commands:
+        return
+
+    gpu_arg_names = [
+        "engine",
+        "gpu_device",
+        "gpu_dtype",
+        "gpu_allow_tf32",
+        "gpu_compile",
+        "gpu_eps",
+        "gpu_check_every",
+        "gpu_compile_block",
+    ]
+    if any(getattr(args, name) is not None for name in gpu_arg_names):
+        commands = ", ".join(available_commands)
+        raise ValueError(f"NMF engine/GPU options are only valid with: {commands}")
+
+
+def configure_nmf_engine(cnmf_obj, engine="cpu", gpu_kwargs=None):
+    """Configure a cNMF instance with an optional GPU NMF adapter."""
+    if engine not in ("cpu", "gpu"):
+        raise ValueError("engine must be 'cpu' or 'gpu'")
+    if engine == "cpu":
+        return cnmf_obj
+
+    def _gpu_nmf(X, nmf_kwargs):
+        nmf_kwargs = dict(nmf_kwargs)
+        nmf_kwargs["engine"] = "gpu"
+        nmf_kwargs["gpu"] = gpu_kwargs or {}
+        return _nmf_gpu(cnmf_obj, X, nmf_kwargs)
+
+    cnmf_obj._nmf = _gpu_nmf
+    return cnmf_obj
+
+
 def _resolve_gpu_opts(gpu_kwargs):
     """Merge Nextflow-provided gpu_kwargs over defaults into a typed opts dict."""
     raw = dict(gpu_kwargs or {})
@@ -361,4 +431,9 @@ def factorize_nmf_gpu(X, nmf_kwargs, gpu_kwargs=None):
 
 def _nmf_gpu(self, X, nmf_kwargs, gpu_kwargs=None):
     """cNMF adapter: same core NMF kernel, with `self` ignored for monkeypatch compatibility."""
+    nmf_kwargs = dict(nmf_kwargs)
+    embedded_gpu_kwargs = nmf_kwargs.pop("gpu", None)
+    nmf_kwargs.pop("engine", None)
+    if gpu_kwargs is None:
+        gpu_kwargs = embedded_gpu_kwargs
     return factorize_nmf_gpu(X, nmf_kwargs, gpu_kwargs)
