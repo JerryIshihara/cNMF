@@ -22,6 +22,25 @@ pip install harmonypy
 pip install scikit-misc
 ```
 
+# GPU NMF parity tests
+
+The regular GPU-NMF test suite compares sklearn Frobenius MU with the PyTorch
+kernel in fp64 and fp32 using identical inputs, initialization seeds, and MU
+iteration counts. CUDA cases run when a CUDA device is available:
+
+```bash
+pytest -q tests/test_nmf_gpu.py -k sklearn_mu_matches
+```
+
+The 100,000-cell by 20,000-gene cases are opt-in because the dense input alone
+uses 7.45 GiB in fp32 or 14.90 GiB in fp64. They run one rank-2 MU iteration
+and check host/device memory before allocating:
+
+```bash
+CNMF_RUN_LARGE_GPU_PARITY=1 \
+pytest -q tests/test_nmf_gpu.py -k 100k_by_20k
+```
+
 # Running cNMF
 
 cNMF can be run from the command line without any parallelization using the example commands below:

@@ -39,11 +39,20 @@ Device, dtype, imports, sparse, and backend policy
     Uses fake backends for portable device/dtype policy checks, verifies loud
     dependency errors, covers the current sparse densify path, and keeps
     CUDA-only fp32/bf16/TF32 behavior behind device-gated tests.
+
+sklearn MU parity
+    Compares final aligned W/H factors against sklearn Frobenius MU for fp64
+    and fp32 with identical initialization, seed, and iteration count. Small
+    cases run routinely on the torch CPU backend and CUDA when available. An
+    opt-in, memory-gated CUDA stress case uses a 100,000 x 20,000 matrix.
 """
 
-from types import SimpleNamespace
 import argparse
 import builtins
+import gc
+import os
+import warnings
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -165,12 +174,40 @@ def test_mu_step_updates_w_first_using_old_h_then_h_using_new_w(kernel):
     H0 = torch.tensor([[0.6, 0.8], [1.0, 1.2]], dtype=torch.float64)
     eps = torch.tensor(1e-9, dtype=torch.float64)
 
-    expected_W = W0 * ((Xg @ H0.T) / (W0 @ (H0 @ H0.T) + eps))
-    expected_H = H0 * ((expected_W.T @ Xg) / ((expected_W.T @ expected_W) @ H0 + eps))
+    denominator = W0 @ (H0 @ H0.T)
+    denominator = denominator.where(denominator != 0, eps)
+    expected_W = W0 * ((Xg @ H0.T) / denominator)
+    denominator = (expected_W.T @ expected_W) @ H0
+    denominator = denominator.where(denominator != 0, eps)
+    expected_H = H0 * ((expected_W.T @ Xg) / denominator)
     W, H = kernel._mu_step(W0, H0, Xg, eps)
 
     assert torch.allclose(W, expected_W)
     assert torch.allclose(H, expected_H)
+
+
+def test_mu_step_fixed_h_matches_sklearn_exact_zero_protection(kernel):
+    """Replace exact zeros while leaving tiny nonzero denominators untouched."""
+    torch = require_nmf_runtime()
+    eps = torch.tensor(np.finfo(np.float32).eps, dtype=torch.float64)
+
+    zero_result = kernel._mu_step_fixed_h(
+        torch.ones((1, 1), dtype=torch.float64),
+        torch.zeros((1, 1), dtype=torch.float64),
+        torch.ones((1, 1), dtype=torch.float64),
+        eps,
+    )
+    assert torch.equal(zero_result, torch.zeros_like(zero_result))
+    assert torch.isfinite(zero_result).all()
+
+    tiny = torch.tensor(1e-12, dtype=torch.float64)
+    tiny_result = kernel._mu_step_fixed_h(
+        torch.ones((1, 1), dtype=torch.float64),
+        tiny.reshape(1, 1),
+        torch.ones((1, 1), dtype=torch.float64),
+        eps,
+    )
+    assert torch.equal(tiny_result, (1 / tiny).reshape(1, 1))
 
 
 def test_fit_mu_early_stops_when_relative_error_drop_is_below_tol(kernel):
@@ -341,6 +378,191 @@ def test_nmf_gpu_custom_init_raises(kernel):
 
 
 # ---------------------------------------------------------------------
+# sklearn Frobenius-MU parity: same input, initialization, seed, iterations
+# ---------------------------------------------------------------------
+PARITY_CASES = [
+    pytest.param("fp64", np.float64, 2e-8, 1e-9, id="fp64"),
+    pytest.param("fp32", np.float32, 2e-5, 2e-6, id="fp32"),
+]
+
+LARGE_PARITY_ENV = "CNMF_RUN_LARGE_GPU_PARITY"
+LARGE_PARITY_ROWS = 100_000
+LARGE_PARITY_COLUMNS = 20_000
+LARGE_PARITY_COMPONENTS = 2
+
+
+def _parity_nmf_kwargs(n_components, seed, max_iter):
+    """Return the common, unregularized sklearn/GPU Frobenius-MU contract."""
+    return {
+        "n_components": n_components,
+        "init": "random",
+        "random_state": seed,
+        "solver": "mu",
+        "beta_loss": "frobenius",
+        "tol": 0.0,
+        "max_iter": max_iter,
+        "alpha_W": 0.0,
+        "alpha_H": 0.0,
+        "l1_ratio": 0.0,
+    }
+
+
+def _sklearn_mu_reference(X, nmf_kwargs):
+    """Run sklearn MU and require the requested fixed iteration count."""
+    pytest.importorskip("sklearn")
+    from sklearn.decomposition import non_negative_factorization
+    from sklearn.exceptions import ConvergenceWarning
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        W, H, n_iter = non_negative_factorization(X, **nmf_kwargs)
+    assert n_iter == nmf_kwargs["max_iter"]
+    return H, W
+
+
+def _gpu_parity_result(kernel, X, nmf_kwargs, dtype_name, device):
+    """Run the PyTorch kernel without TF32, compilation, or early stopping."""
+    return kernel._nmf_gpu(
+        X,
+        nmf_kwargs,
+        {
+            "device": device,
+            "dtype": dtype_name,
+            "allow_tf32": False,
+            "compile": False,
+            # One convergence block means every requested MU iteration runs
+            # before the first possible tolerance check.
+            "check_every": nmf_kwargs["max_iter"],
+        },
+    )
+
+
+def _relative_reconstruction_error(X, H, W):
+    """Compute reconstruction error in float64, independent of compute dtype."""
+    X64 = np.asarray(X, dtype=np.float64)
+    H64 = np.asarray(H, dtype=np.float64)
+    W64 = np.asarray(W, dtype=np.float64)
+    return np.linalg.norm(X64 - W64 @ H64) / np.linalg.norm(X64)
+
+
+@pytest.mark.parametrize("dtype_name,np_dtype,rtol,atol", PARITY_CASES)
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("seed", [0, 17, 101])
+@pytest.mark.parametrize("max_iter", [1, 25])
+def test_sklearn_mu_matches_gpu_kernel_on_small_matrix(
+    kernel, dtype_name, np_dtype, rtol, atol, device, seed, max_iter
+):
+    """Match sklearn exactly on CPU and numerically on CUDA across aligned seeds."""
+    torch = require_nmf_runtime()
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    X = np.random.default_rng(42).random((64, 48), dtype=np_dtype)
+    X += np_dtype(0.1)  # strictly positive denominators avoid degenerate MU behavior
+    nmf_kwargs = _parity_nmf_kwargs(
+        n_components=4,
+        seed=seed,
+        max_iter=max_iter,
+    )
+
+    expected_H, expected_W = _sklearn_mu_reference(X, nmf_kwargs)
+    actual_H, actual_W = _gpu_parity_result(
+        kernel, X, nmf_kwargs, dtype_name, device
+    )
+
+    if device == "cpu":
+        np.testing.assert_array_equal(actual_H, expected_H)
+        np.testing.assert_array_equal(actual_W, expected_W)
+    else:
+        np.testing.assert_allclose(actual_H, expected_H, rtol=rtol, atol=atol)
+        np.testing.assert_allclose(actual_W, expected_W, rtol=rtol, atol=atol)
+        np.testing.assert_allclose(
+            _relative_reconstruction_error(X, actual_H, actual_W),
+            _relative_reconstruction_error(X, expected_H, expected_W),
+            rtol=rtol,
+            atol=atol,
+        )
+
+
+def _available_host_memory_bytes():
+    """Return Linux available host memory when sysconf exposes it."""
+    try:
+        return int(os.sysconf("SC_AVPHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _require_large_cuda_parity_capacity(torch, np_dtype):
+    """Skip the destructive-size stress case unless explicitly enabled and safe."""
+    if os.environ.get(LARGE_PARITY_ENV) != "1":
+        pytest.skip(f"set {LARGE_PARITY_ENV}=1 to run the 100K x 20K parity stress test")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    x_bytes = (
+        LARGE_PARITY_ROWS
+        * LARGE_PARITY_COLUMNS
+        * np.dtype(np_dtype).itemsize
+    )
+    available_host = _available_host_memory_bytes()
+    required_host = 3 * x_bytes
+    if available_host is not None and available_host < required_host:
+        pytest.skip(
+            f"large parity needs about {required_host / 2**30:.1f} GiB available host "
+            f"memory; found {available_host / 2**30:.1f} GiB"
+        )
+
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    required_device = int(1.25 * x_bytes)
+    if properties.total_memory < required_device:
+        pytest.skip(
+            f"large parity needs a device with at least {required_device / 2**30:.1f} "
+            f"GiB addressable memory; found {properties.total_memory / 2**30:.1f} GiB"
+        )
+    if not getattr(properties, "is_integrated", False):
+        free_device, _ = torch.cuda.mem_get_info()
+        if free_device < required_device:
+            pytest.skip(
+                f"large parity needs about {required_device / 2**30:.1f} GiB free GPU "
+                f"memory; found {free_device / 2**30:.1f} GiB"
+            )
+
+
+@pytest.mark.parametrize("dtype_name,np_dtype,rtol,atol", PARITY_CASES)
+def test_sklearn_mu_matches_cuda_on_100k_by_20k_matrix(
+    kernel, dtype_name, np_dtype, rtol, atol
+):
+    """Stress sklearn/CUDA parity on a 100K x 20K dense matrix for one MU iteration."""
+    torch = require_nmf_runtime()
+    _require_large_cuda_parity_capacity(torch, np_dtype)
+
+    X = np.random.default_rng(42).random(
+        (LARGE_PARITY_ROWS, LARGE_PARITY_COLUMNS),
+        dtype=np_dtype,
+    )
+    X += np_dtype(0.1)
+    nmf_kwargs = _parity_nmf_kwargs(
+        n_components=LARGE_PARITY_COMPONENTS,
+        seed=17,
+        max_iter=1,
+    )
+
+    try:
+        expected_H, expected_W = _sklearn_mu_reference(X, nmf_kwargs)
+        actual_H, actual_W = _gpu_parity_result(
+            kernel, X, nmf_kwargs, dtype_name, "cuda"
+        )
+
+        np.testing.assert_allclose(actual_H, expected_H, rtol=rtol, atol=atol)
+        np.testing.assert_allclose(actual_W, expected_W, rtol=rtol, atol=atol)
+    finally:
+        # Do not make a following dtype inherit this case's multi-GiB CUDA cache.
+        del X
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+# ---------------------------------------------------------------------
 # Input validation and degenerate shapes
 # ---------------------------------------------------------------------
 def test_nmf_gpu_rejects_negative_input(kernel):
@@ -437,6 +659,11 @@ def test_nmf_gpu_defines_behavior_when_k_exceeds_min_dimension(kernel):
 def test_resolve_gpu_opts_uses_defaults_when_gpu_kwargs_is_missing(kernel):
     """Missing gpu_kwargs should resolve exactly to the centralized DEFAULT_GPU values."""
     assert kernel._resolve_gpu_opts(None) == kernel.DEFAULT_GPU
+
+
+def test_default_gpu_epsilon_matches_sklearn_exact_value(kernel):
+    """Pin sklearn's float32 epsilon without importing its private EPSILON symbol."""
+    assert kernel.DEFAULT_GPU["eps"] == float(np.finfo(np.float32).eps)
 
 
 def test_resolve_gpu_opts_dict_values_override_defaults(kernel):
@@ -1180,7 +1407,9 @@ def test_mu_step_fixed_h_matches_manual_w_only_update(kernel):
     eps = torch.tensor(1e-9, dtype=torch.float64)
     H_before = H.clone()
 
-    expected_W = W0 * ((Xg @ H.T) / (W0 @ (H @ H.T) + eps))
+    denominator = W0 @ (H @ H.T)
+    denominator = denominator.where(denominator != 0, eps)
+    expected_W = W0 * ((Xg @ H.T) / denominator)
     W = kernel._mu_step_fixed_h(W0, H, Xg, eps)
 
     assert torch.allclose(W, expected_W)
