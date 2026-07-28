@@ -35,12 +35,15 @@ DEFAULT_NMF = {
 }
 
 
+_SKLEARN_EPSILON = float(np.finfo(np.float32).eps)
+
+
 DEFAULT_GPU = {
     "device": "auto",
     "dtype": "auto",
     "allow_tf32": False,
     "compile": False,
-    "eps": 1e-9,
+    "eps": _SKLEARN_EPSILON,
     "check_every": 10,
     "compile_block": 1,
     "batch": 1,             # factorize replicates per launch
@@ -60,7 +63,7 @@ def parse_gpu_args(parser):
     group.add_argument("--gpu-dtype", type=str.lower, choices=["auto", "fp32", "fp64", "bf16"], help="[factorize,consensus,gpu] Storage and matmul dtype for GPU NMF (default auto)")
     group.add_argument("--gpu-allow-tf32", action="store_const", const=True, help="[factorize,consensus,gpu] Allow TF32 for CUDA fp32 matrix multiplication")
     group.add_argument("--gpu-compile", action="store_const", const=True, help="[factorize,consensus,gpu] Enable torch.compile for the GPU NMF update step")
-    group.add_argument("--gpu-eps", type=float, help="[factorize,consensus,gpu] Multiplicative-update denominator guard")
+    group.add_argument("--gpu-eps", type=float, help="[factorize,consensus,gpu] Replacement for exactly-zero MU denominators")
     group.add_argument("--gpu-check-every", type=int, help="[factorize,consensus,gpu] Eager-mode convergence check interval")
     group.add_argument("--gpu-compile-block", type=int, help="[factorize,consensus,gpu] Number of MU iterations per compiled block")
     group.add_argument("--gpu-batch", type=int, help="[factorize] Replicates run per GPU launch (batched MU); 1 = single-replicate")
@@ -310,16 +313,22 @@ def _mu_step(W, H, Xg, eps):
     tensors with shared `Xg[1,n,g]`. Operations are out-of-place for compile.
     """
     Ht = H.transpose(-2, -1)                               # [g,k] or [R,g,k]
-    W = W * ((Xg @ Ht) / (W @ (H @ Ht) + eps))            # W *= XHᵀ / (W·HHᵀ)   (uses old H)
+    denominator = W @ (H @ Ht)
+    denominator = denominator.where(denominator != 0, eps)
+    W = W * ((Xg @ Ht) / denominator)                      # W *= XHᵀ / (W·HHᵀ)   (uses old H)
     Wt = W.transpose(-2, -1)                               # [k,n] or [R,k,n]
-    H = H * ((Wt @ Xg) / ((Wt @ W) @ H + eps))            # H *= WᵀX / (WᵀW·H)   (uses new W)
+    denominator = (Wt @ W) @ H
+    denominator = denominator.where(denominator != 0, eps)
+    H = H * ((Wt @ Xg) / denominator)                      # H *= WᵀX / (WᵀW·H)   (uses new W)
     return W, H
 
 
 def _mu_step_fixed_h(W, H, Xg, eps):
     """One fixed-H MU update; only W changes. Supports 2D or stacked W."""
     Ht = H.transpose(-2, -1)                               # [g,k] or [1,g,k]
-    return W * ((Xg @ Ht) / (W @ (H @ Ht) + eps))
+    denominator = W @ (H @ Ht)
+    denominator = denominator.where(denominator != 0, eps)
+    return W * ((Xg @ Ht) / denominator)
 
 
 # ---------------------------------------------------------------------
@@ -438,7 +447,7 @@ def _to_device_factors(torch, W0, H0, dtype, device):
 
 
 def _to_device_eps(torch, eps, dtype, device):
-    """Create the MU denominator guard on runtime dtype/device."""
+    """Create the exact-zero denominator replacement on runtime dtype/device."""
     return torch.tensor(eps, dtype=dtype, device=device)
 
 
