@@ -49,7 +49,7 @@ setuptools.setup(
    'pyyaml'
    ],
     extras_require={
-        # GPU NMF engine (src/cnmf/nmf_gpu.py): PyTorch multiplicative-update kernel.
+        # GPU NMF engine: PyTorch MU plus fused CUDA Fast-HALS coordinate descent.
         # Install with:  pip install -e ".[gpu]"
         'gpu': ['torch>=2.0'],
         'test': ['pytest'],

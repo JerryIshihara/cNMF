@@ -563,6 +563,343 @@ def test_sklearn_mu_matches_cuda_on_100k_by_20k_matrix(
 
 
 # ---------------------------------------------------------------------
+# sklearn coordinate-descent / Fast-HALS parity
+# ---------------------------------------------------------------------
+CD_PARITY_CASES = [
+    pytest.param("fp64", np.float64, 5e-10, 5e-11, id="fp64"),
+    pytest.param("fp32", np.float32, 8e-5, 8e-6, id="fp32"),
+]
+
+
+def _cd_nmf_kwargs(n_components, seed, max_iter, **overrides):
+    """Return a deterministic sklearn CD contract shared by all parity tests."""
+    kwargs = {
+        "n_components": n_components,
+        "init": "random",
+        "random_state": seed,
+        "solver": "cd",
+        "beta_loss": "frobenius",
+        "tol": 0.0,
+        "max_iter": max_iter,
+        "alpha_W": 0.03,
+        "alpha_H": 0.02,
+        "l1_ratio": 0.25,
+        "shuffle": False,
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def _sklearn_cd_reference(X, nmf_kwargs, W=None, H=None):
+    """Run sklearn CD from the same explicit inputs and return cNMF's H/W order."""
+    pytest.importorskip("sklearn")
+    from sklearn.decomposition import non_negative_factorization
+    from sklearn.exceptions import ConvergenceWarning
+
+    kwargs = dict(nmf_kwargs)
+    # The GPU adapter carries a fixed H inside nmf_kwargs; sklearn receives it
+    # through the dedicated H parameter instead.
+    kwargs.pop("H", None)
+    kwargs.pop("W", None)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        expected_W, expected_H, n_iter = non_negative_factorization(
+            X, W=W, H=H, **kwargs
+        )
+    if kwargs["tol"] == 0 and np.any(X):
+        assert n_iter == kwargs["max_iter"]
+    return expected_H, expected_W, n_iter
+
+
+@pytest.mark.parametrize("dtype_name,np_dtype,rtol,atol", CD_PARITY_CASES)
+@pytest.mark.parametrize("seed,max_iter", [(0, 1), (19, 8)])
+def test_sklearn_cd_matches_fast_hals_on_torch_cpu(
+    kernel, dtype_name, np_dtype, rtol, atol, seed, max_iter
+):
+    """Match sklearn CD updates, regularization, and cyclic order in fp32/fp64."""
+    require_nmf_runtime()
+    X = np.random.default_rng(42).random((17, 11), dtype=np_dtype)
+    X += np_dtype(0.1)
+    nmf_kwargs = _cd_nmf_kwargs(3, seed, max_iter)
+
+    expected_H, expected_W, _ = _sklearn_cd_reference(X, nmf_kwargs)
+    actual_H, actual_W = kernel._nmf_gpu(
+        X,
+        nmf_kwargs,
+        {
+            "device": "cpu",
+            "dtype": dtype_name,
+            "allow_tf32": False,
+            "compile": False,
+        },
+    )
+
+    np.testing.assert_allclose(actual_H, expected_H, rtol=rtol, atol=atol)
+    np.testing.assert_allclose(actual_W, expected_W, rtol=rtol, atol=atol)
+    np.testing.assert_allclose(
+        _relative_reconstruction_error(X, actual_H, actual_W),
+        _relative_reconstruction_error(X, expected_H, expected_W),
+        rtol=rtol,
+        atol=atol,
+    )
+
+
+@pytest.mark.parametrize("dtype_name,np_dtype,rtol,atol", CD_PARITY_CASES)
+def test_fast_hals_batched_seeds_match_independent_runs(
+    kernel, dtype_name, np_dtype, rtol, atol
+):
+    """Parallel replicate slices must not alter any seed's independent CD path."""
+    require_nmf_runtime()
+    X = np.random.default_rng(7).random((19, 13), dtype=np_dtype) + np_dtype(0.1)
+    seeds = [23, 2, 41]
+    nmf_kwargs = _cd_nmf_kwargs(4, seed=0, max_iter=6)
+    gpu_kwargs = {
+        "device": "cpu",
+        "dtype": dtype_name,
+        "allow_tf32": False,
+        "compile": False,
+    }
+
+    batched = kernel._nmf_gpu_cd(X, seeds, nmf_kwargs, gpu_kwargs)
+
+    assert len(batched) == len(seeds)
+    for (batched_H, batched_W), seed in zip(batched, seeds):
+        (single_H, single_W), = kernel._nmf_gpu_cd(
+            X, [seed], nmf_kwargs, gpu_kwargs
+        )
+        np.testing.assert_allclose(
+            batched_H, single_H, rtol=rtol, atol=atol
+        )
+        np.testing.assert_allclose(
+            batched_W, single_W, rtol=rtol, atol=atol
+        )
+
+
+@pytest.mark.parametrize("dtype_name,np_dtype,rtol,atol", CD_PARITY_CASES)
+def test_sklearn_cd_fixed_h_matches_batched_fast_hals(
+    kernel, dtype_name, np_dtype, rtol, atol
+):
+    """Fixed-H CD should preserve H and match sklearn's W-only coordinate sweeps."""
+    require_nmf_runtime()
+    rng = np.random.default_rng(31)
+    X = rng.random((15, 9), dtype=np_dtype) + np_dtype(0.1)
+    fixed_H = rng.random((3, 9), dtype=np_dtype) + np_dtype(0.1)
+    seeds = [5, 29]
+    nmf_kwargs = _cd_nmf_kwargs(
+        3,
+        seed=0,
+        max_iter=7,
+        update_H=False,
+        H=fixed_H,
+    )
+    gpu_kwargs = {
+        "device": "cpu",
+        "dtype": dtype_name,
+        "allow_tf32": False,
+        "compile": False,
+    }
+
+    actual = kernel._nmf_gpu_cd(X, seeds, nmf_kwargs, gpu_kwargs)
+
+    for (actual_H, actual_W), seed in zip(actual, seeds):
+        expected_kwargs = dict(nmf_kwargs, init="custom", random_state=None)
+        expected_H, expected_W, _ = _sklearn_cd_reference(
+            X,
+            expected_kwargs,
+            H=fixed_H.copy(),
+        )
+        np.testing.assert_array_equal(actual_H, fixed_H.astype(np.float64))
+        np.testing.assert_array_equal(expected_H, fixed_H)
+        np.testing.assert_allclose(
+            actual_W, expected_W, rtol=rtol, atol=atol
+        )
+
+
+def test_fast_hals_batched_convergence_iterations_match_sklearn(kernel):
+    """Each batched slice should stop on the same projected-gradient iteration."""
+    require_nmf_runtime()
+    X = np.random.default_rng(63).random((31, 17)) + 0.1
+    seeds = [0, 7, 103]
+    nmf_kwargs = _cd_nmf_kwargs(
+        4,
+        seed=0,
+        max_iter=200,
+        tol=1e-4,
+        alpha_W=0.0,
+        alpha_H=0.0,
+        l1_ratio=0.0,
+    )
+
+    actual, actual_n_iter = kernel._nmf_gpu_cd(
+        X,
+        seeds,
+        nmf_kwargs,
+        {"device": "cpu", "dtype": "fp64", "allow_tf32": False},
+        return_n_iter=True,
+    )
+
+    expected_n_iter = []
+    for (actual_H, actual_W), seed in zip(actual, seeds):
+        expected_H, expected_W, n_iter = _sklearn_cd_reference(
+            X, dict(nmf_kwargs, random_state=seed)
+        )
+        expected_n_iter.append(n_iter)
+        np.testing.assert_allclose(
+            actual_H, expected_H, rtol=5e-10, atol=5e-11
+        )
+        np.testing.assert_allclose(
+            actual_W, expected_W, rtol=5e-10, atol=5e-11
+        )
+
+    np.testing.assert_array_equal(
+        actual_n_iter, np.asarray(expected_n_iter)
+    )
+
+
+def test_fast_hals_batched_shuffle_matches_sklearn(kernel):
+    """Shuffled CD must use sklearn's per-seed permutation stream."""
+    require_nmf_runtime()
+    X = np.random.default_rng(81).random((21, 12)) + 0.1
+    seeds = [13, 47]
+    nmf_kwargs = _cd_nmf_kwargs(
+        3,
+        seed=0,
+        max_iter=7,
+        shuffle=True,
+        alpha_W=0.0,
+        alpha_H=0.0,
+        l1_ratio=0.0,
+    )
+
+    actual = kernel._nmf_gpu_cd(
+        X,
+        seeds,
+        nmf_kwargs,
+        {"device": "cpu", "dtype": "fp64", "allow_tf32": False},
+    )
+
+    for (actual_H, actual_W), seed in zip(actual, seeds):
+        expected_H, expected_W, _ = _sklearn_cd_reference(
+            X, dict(nmf_kwargs, random_state=seed)
+        )
+        np.testing.assert_allclose(
+            actual_H, expected_H, rtol=5e-10, atol=5e-11
+        )
+        np.testing.assert_allclose(
+            actual_W, expected_W, rtol=5e-10, atol=5e-11
+        )
+
+
+def test_nmf_gpu_batch_dispatches_default_mu_and_explicit_cd(kernel, monkeypatch):
+    """The GPU batch dispatcher should default to MU and select CD explicitly."""
+    calls = []
+
+    def fake_mu(X, seeds, nmf_kwargs, gpu_kwargs=None):
+        calls.append(("mu", list(seeds), dict(nmf_kwargs), gpu_kwargs))
+        return ["mu-result"]
+
+    def fake_cd(X, seeds, nmf_kwargs, gpu_kwargs=None, **kwargs):
+        calls.append(("cd", list(seeds), dict(nmf_kwargs), gpu_kwargs))
+        return ["cd-result"]
+
+    monkeypatch.setattr(kernel, "_nmf_gpu_mu", fake_mu)
+    monkeypatch.setattr(kernel, "_nmf_gpu_cd", fake_cd)
+    X = np.ones((3, 2))
+
+    assert kernel._nmf_gpu_batch(
+        X, [7], {"n_components": 1}, {"device": "cpu"}
+    ) == ["mu-result"]
+    assert kernel._nmf_gpu_batch(
+        X, [11], {"n_components": 1, "solver": "cd"}, {"device": "cpu"}
+    ) == ["cd-result"]
+    assert [call[0] for call in calls] == ["mu", "cd"]
+
+
+def test_nmf_gpu_batch_rejects_unknown_solver(kernel):
+    """An unknown solver must fail instead of silently falling back to MU."""
+    with pytest.raises(ValueError, match="solver"):
+        kernel._nmf_gpu_batch(
+            np.ones((3, 2)),
+            [0],
+            {"n_components": 1, "solver": "als"},
+            {"device": "cpu"},
+        )
+
+
+@pytest.mark.parametrize(
+    "nmf_overrides,gpu_overrides,message",
+    [
+        ({"beta_loss": "kullback-leibler"}, {}, "beta_loss"),
+        ({"tol": -1.0}, {}, "tol"),
+        ({"alpha": 0.1}, {}, "alpha_W"),
+        ({}, {"allow_tf32": True}, "TF32|tf32"),
+    ],
+)
+def test_fast_hals_rejects_options_that_break_sklearn_cd_semantics(
+    kernel, nmf_overrides, gpu_overrides, message
+):
+    """Reject CD options unsupported by the sklearn-compatible implementation."""
+    require_nmf_runtime()
+    nmf_kwargs = _cd_nmf_kwargs(2, seed=0, max_iter=1)
+    nmf_kwargs.update(nmf_overrides)
+    gpu_kwargs = {
+        "device": "cpu",
+        "dtype": "fp64",
+        "allow_tf32": False,
+        **gpu_overrides,
+    }
+
+    with pytest.raises(ValueError, match=message):
+        kernel._nmf_gpu(
+            small_nonnegative_matrix(cells=5, genes=4),
+            nmf_kwargs,
+            gpu_kwargs,
+        )
+
+
+@pytest.mark.parametrize("dtype_name,np_dtype,rtol,atol", CD_PARITY_CASES)
+def test_sklearn_cd_matches_batched_fast_hals_on_cuda_when_available(
+    kernel, dtype_name, np_dtype, rtol, atol
+):
+    """Match sklearn for multiple seeds through the fused CUDA Fast-HALS sweep."""
+    torch = require_nmf_runtime()
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    X = np.random.default_rng(101).random((23, 14), dtype=np_dtype)
+    X += np_dtype(0.1)
+    seeds = [3, 37]
+    nmf_kwargs = _cd_nmf_kwargs(4, seed=0, max_iter=5)
+    actual = kernel._nmf_gpu_cd(
+        X,
+        seeds,
+        nmf_kwargs,
+        {
+            "device": "cuda",
+            "dtype": dtype_name,
+            "allow_tf32": False,
+            "compile": False,
+        },
+    )
+
+    # CUDA matmul/reduction order can differ from CPU BLAS; the coordinate
+    # order, guards, regularization, and stopping semantics remain identical.
+    cuda_rtol = max(rtol, 2e-4 if np_dtype is np.float32 else 2e-9)
+    cuda_atol = max(atol, 2e-5 if np_dtype is np.float32 else 2e-10)
+    for (actual_H, actual_W), seed in zip(actual, seeds):
+        expected_kwargs = dict(nmf_kwargs, random_state=seed)
+        expected_H, expected_W, _ = _sklearn_cd_reference(
+            X, expected_kwargs
+        )
+        np.testing.assert_allclose(
+            actual_H, expected_H, rtol=cuda_rtol, atol=cuda_atol
+        )
+        np.testing.assert_allclose(
+            actual_W, expected_W, rtol=cuda_rtol, atol=cuda_atol
+        )
+
+
+# ---------------------------------------------------------------------
 # Input validation and degenerate shapes
 # ---------------------------------------------------------------------
 def test_nmf_gpu_rejects_negative_input(kernel):

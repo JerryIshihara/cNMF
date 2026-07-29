@@ -22,14 +22,33 @@ pip install harmonypy
 pip install scikit-misc
 ```
 
-# GPU NMF parity tests
+# GPU NMF solvers and parity tests
 
-The regular GPU-NMF test suite compares sklearn Frobenius MU with the PyTorch
-kernel in fp64 and fp32 using identical inputs, initialization seeds, and MU
-iteration counts. CUDA cases run when a CUDA device is available:
+cNMF defaults to the multiplicative-update solver (`--solver mu`). Select
+scikit-learn Fast-HALS coordinate descent with `--solver cd`; CD requires
+Frobenius loss. The solver is saved by `prepare`, while the CPU/GPU engine and
+replicate batch size are selected when `factorize` runs:
 
 ```bash
-pytest -q tests/test_nmf_gpu.py -k sklearn_mu_matches
+cnmf prepare --output-dir ./example_data --name example_cNMF \
+  -c ./example_data/counts_prefiltered.txt -k 20 --n-iter 100 \
+  --solver cd --beta-loss frobenius
+
+cnmf factorize --output-dir ./example_data --name example_cNMF \
+  --engine gpu --gpu-device cuda --gpu-dtype fp32 --gpu-batch 8
+```
+
+GPU Fast-HALS preserves sklearn's initialization, W-then-H update order,
+cyclic component order, regularization, projected-gradient stopping rule, and
+exact zero-Hessian guard. Replicates and matrix rows are parallelized. Floating
+point reductions differ across BLAS/CUDA implementations, so parity is tested
+with dtype-appropriate numerical tolerances rather than bitwise equality.
+
+The regular GPU-NMF test suite compares sklearn MU and CD with the PyTorch
+kernels in fp64 and fp32. CUDA cases run when a CUDA device is available:
+
+```bash
+pytest -q tests/test_nmf_gpu.py -k "sklearn_mu_matches or sklearn_cd"
 ```
 
 The 100,000-cell by 20,000-gene cases are opt-in because the dense input alone

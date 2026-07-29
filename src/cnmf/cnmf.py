@@ -332,7 +332,8 @@ class cNMF():
 
     def prepare(self, counts_fn, components, n_iter = 100, densify=False, tpm_fn=None, seed=None,
                         beta_loss='frobenius',num_highvar_genes=2000, genes_file=None,
-                        alpha_usage=0.0, alpha_spectra=0.0, init='random', max_NMF_iter=1000):
+                        alpha_usage=0.0, alpha_spectra=0.0, init='random', max_NMF_iter=1000,
+                        solver='mu'):
         """
         Load input counts, reduce to high-variance genes, and variance normalize genes.
         Prepare file for distributing jobs over workers.
@@ -362,6 +363,10 @@ class cNMF():
             Seed for sklearn random state.
             
         beta_loss : str or None, optional (default='frobenius')
+
+        solver : {'mu', 'cd'}, optional (default='mu')
+            NMF solver. ``cd`` selects Fast-HALS coordinate descent and requires
+            ``beta_loss='frobenius'``.
 
         num_highvar_genes : int or None, optional (default=2000)
             If provided and genes_file is None, will compute this many highvar genes to use for factorization
@@ -455,7 +460,8 @@ class cNMF():
         self.save_norm_counts(norm_counts)
         (replicate_params, run_params) = self.get_nmf_iter_params(ks=components, n_iter=n_iter, random_state_seed=seed,
                                                                   beta_loss=beta_loss, alpha_usage=alpha_usage,
-                                                                  alpha_spectra=alpha_spectra, init=init, max_iter=max_NMF_iter)
+                                                                  alpha_spectra=alpha_spectra, init=init,
+                                                                  max_iter=max_NMF_iter, solver=solver)
         self.save_nmf_iter_params(replicate_params, run_params)
         
     
@@ -565,7 +571,7 @@ class cNMF():
                                random_state_seed = None,
                                beta_loss = 'kullback-leibler',
                                alpha_usage=0.0, alpha_spectra=0.0,
-                               init='random', max_iter=1000):
+                               init='random', max_iter=1000, solver='mu'):
         """
         Create a DataFrame with parameters for NMF iterations.
 
@@ -588,7 +594,16 @@ class cNMF():
 
         alpha_spectra : float, optional (default=0.0)
             Regularization parameter for NMF corresponding to alpha_H in scikit-learn
+
+        solver : {'mu', 'cd'}, optional (default='mu')
+            Numerical solver. Coordinate descent supports Frobenius loss only.
         """
+
+        solver = str(solver).lower()
+        if solver not in ('mu', 'cd'):
+            raise ValueError("solver must be 'mu' or 'cd'")
+        if solver == 'cd' and beta_loss != 'frobenius':
+            raise ValueError("solver='cd' supports only beta_loss='frobenius'")
 
         if type(ks) is int:
             ks = [ks]
@@ -620,15 +635,11 @@ class cNMF():
                         alpha_H=alpha_spectra,
                         l1_ratio=0.0,
                         beta_loss=beta_loss,
-                        solver='mu',
+                        solver=solver,
                         tol=1e-4,
                         max_iter=max_iter,
                         init=init
                         )
-        
-        ## Coordinate descent is faster than multiplicative update but only works for frobenius
-        if beta_loss == 'frobenius':
-            _nmf_kwargs['solver'] = 'cd'
 
         return(replicate_params, _nmf_kwargs)
     
@@ -1254,6 +1265,7 @@ def main():
     parser.add_argument('--tpm', type=str, help='[prepare] Pre-computed (cell x gene) TPM values as df.npz or tab separated txt file. If not provided TPM will be calculated automatically', default=None)
     parser.add_argument('--max-nmf-iter', type=int, help='[prepare] Max number of iterations per individual NMF run (default 1000)', default=1000)
     parser.add_argument('--beta-loss', type=str, choices=['frobenius', 'kullback-leibler', 'itakura-saito'], help='[prepare] Loss function for NMF (default frobenius)', default='frobenius')
+    parser.add_argument('--solver', type=str.lower, choices=['mu', 'cd'], help='[prepare] NMF solver: multiplicative update or Fast-HALS coordinate descent (default mu)', default='mu')
     parser.add_argument('--init', type=str, choices=['random', 'nndsvd'], help='[prepare] Initialization algorithm for NMF (default random)', default='random')
     parser.add_argument('--densify', dest='densify', help='[prepare] Treat the input data as non-sparse (default False)', action='store_true', default=False) 
     parser.add_argument('--worker-index', type=int, help='[factorize] Index of current worker (the first worker should have index 0)', default=0)
@@ -1278,7 +1290,8 @@ def main():
     if args.command == 'prepare':
         cnmf_obj.prepare(args.counts, components=args.components, n_iter=args.n_iter, densify=args.densify,
                          tpm_fn=args.tpm, seed=args.seed, beta_loss=args.beta_loss, max_NMF_iter=args.max_nmf_iter,
-                         num_highvar_genes=args.numgenes, genes_file=args.genes_file, init=args.init)
+                         num_highvar_genes=args.numgenes, genes_file=args.genes_file, init=args.init,
+                         solver=args.solver)
 
     elif args.command == 'factorize':
         cnmf_obj.factorize(worker_i=args.worker_index, total_workers=args.total_workers,

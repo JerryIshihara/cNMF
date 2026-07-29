@@ -4,6 +4,7 @@ import pandas as pd
 import scanpy as sc
 import os
 import scipy.sparse as sp
+import yaml
 from cnmf import cNMF, save_df_to_npz, load_df_from_npz
 from cnmf import nmf_gpu
 
@@ -207,6 +208,95 @@ def test_get_nmf_iter_params_default_cpu_engine_does_not_change_sklearn_kwargs(m
     assert "gpu" not in run_params
     # Only the existing cNMF/sklearn factorization keys are present.
     assert set(run_params) == {"alpha_W", "alpha_H", "l1_ratio", "beta_loss", "solver", "tol", "max_iter", "init"}
+
+
+def test_get_nmf_iter_params_defaults_to_mu_even_for_frobenius(mock_cnmf):
+    """Frobenius loss must no longer silently replace the public default MU solver with CD."""
+    _replicate_params, run_params = mock_cnmf.get_nmf_iter_params(
+        ks=[5],
+        n_iter=1,
+        random_state_seed=14,
+        beta_loss="frobenius",
+    )
+
+    assert run_params["beta_loss"] == "frobenius"
+    assert run_params["solver"] == "mu"
+
+
+def test_prepare_persists_explicit_cd_solver(mock_cnmf, tmp_path):
+    """The solver selected at prepare time is cached for factorize/resume."""
+    counts_fn = generate_counts_file(tmp_path, "npz", np.float64)
+
+    mock_cnmf.prepare(
+        counts_fn,
+        components=[5],
+        n_iter=1,
+        densify=True,
+        beta_loss="frobenius",
+        solver="cd",
+    )
+
+    with open(mock_cnmf.paths["nmf_run_parameters"]) as stream:
+        run_params = yaml.safe_load(stream)
+    assert run_params["solver"] == "cd"
+    assert run_params["beta_loss"] == "frobenius"
+
+
+def test_cd_rejects_non_frobenius_loss(mock_cnmf):
+    """Match sklearn: coordinate descent is defined only for Frobenius loss."""
+    with pytest.raises(ValueError, match="frobenius"):
+        mock_cnmf.get_nmf_iter_params(
+            ks=[5],
+            n_iter=1,
+            beta_loss="kullback-leibler",
+            solver="cd",
+        )
+
+
+@pytest.mark.parametrize("solver, expected_backend", [("mu", "mu"), ("cd", "cd")])
+def test_factorize_gpu_dispatches_saved_solver(
+    mock_cnmf, monkeypatch, tmp_path, solver, expected_backend
+):
+    """GPU factorize dispatches every same-k batch from the solver cached by prepare."""
+    counts_fn = generate_counts_file(tmp_path, "npz", np.float64)
+    mock_cnmf.prepare(
+        counts_fn,
+        components=[5],
+        n_iter=2,
+        densify=True,
+        beta_loss="frobenius",
+        solver=solver,
+    )
+
+    calls = []
+
+    def fake_backend(name):
+        def run(X, seeds, nmf_kwargs, gpu_kwargs=None, **_backend_kwargs):
+            calls.append((name, [int(seed) for seed in seeds], dict(nmf_kwargs)))
+            k = int(nmf_kwargs["n_components"])
+            return [
+                (np.zeros((k, X.shape[1])), np.zeros((X.shape[0], k)))
+                for _ in seeds
+            ]
+
+        return run
+
+    monkeypatch.setattr(nmf_gpu, "_nmf_gpu_mu", fake_backend("mu"))
+    monkeypatch.setattr(nmf_gpu, "_nmf_gpu_cd", fake_backend("cd"))
+    nmf_gpu.configure_nmf_engine(
+        mock_cnmf,
+        engine="gpu",
+        gpu_kwargs={"device": "cpu", "batch": 2},
+    )
+
+    mock_cnmf.factorize(worker_i=0, total_workers=1)
+
+    assert len(calls) == 1
+    backend, seeds, run_params = calls[0]
+    assert backend == expected_backend
+    assert len(seeds) == 2
+    assert run_params["solver"] == solver
+    assert run_params["n_components"] == 5
 
 
 def test_factorize_gpu_engine_passes_seed_components_run_params_and_gpu_kwargs(mock_cnmf, monkeypatch, tmp_path):

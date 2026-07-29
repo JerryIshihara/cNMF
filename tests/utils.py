@@ -186,6 +186,8 @@ def regenerate_reproducibility_fixture(dataset, data_root=Path("tests/test_data"
         n_iter=cfg["n_iter"],
         num_highvar_genes=cfg["num_highvar_genes"],
         seed=cfg["seed"],
+        # Preserve the solver used to create the historical reference bundle.
+        solver="cd",
     )
     if total_workers == 1:
         cnmf_obj.factorize(worker_i=0, total_workers=1)

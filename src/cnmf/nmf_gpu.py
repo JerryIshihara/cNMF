@@ -1,8 +1,12 @@
 #!/usr/bin/env python
-"""PyTorch Frobenius-MU NMF backend for cNMF.
+"""PyTorch NMF backend for cNMF.
 
 The kernel is cNMF-compatible: it returns `(spectra, usages) = (H, W)` as numpy
 float64, while compute dtype/device are controlled by `gpu_kwargs`.
+
+Solvers:
+    mu: cNMF's default multiplicative-update solver
+    cd: scikit-learn-compatible Fast-HALS coordinate descent
 
 Supported runtime options:
     device: auto|cuda|cuda:N|mps|cpu     auto = CUDA -> MPS -> CPU
@@ -11,7 +15,10 @@ Supported runtime options:
 
 Explicit unavailable GPUs raise instead of falling back to CPU. MPS is fp32-only
 for this kernel; bf16 is explicit CUDA-only storage and matmul. The implementation
-also supports batched same-k replicates for factorize and fixed-H consensus refits.
+supports batched same-k replicates for factorize and fixed-H consensus refits.
+Fast-HALS batches only independent replicates/rows; its component updates,
+projected-gradient stopping rule, regularization, and exact Hessian guard follow
+scikit-learn coordinate descent.
 """
 import contextlib
 import functools
@@ -32,6 +39,7 @@ DEFAULT_NMF = {
     "max_iter": 1000,
     "tol": 1e-4,
     "init": "random",
+    "solver": "mu",
 }
 
 
@@ -62,11 +70,11 @@ def parse_gpu_args(parser):
     group.add_argument("--gpu-device", type=str, help="[factorize,consensus,gpu] Device for GPU NMF: auto, cpu, cuda, cuda:N, or mps")
     group.add_argument("--gpu-dtype", type=str.lower, choices=["auto", "fp32", "fp64", "bf16"], help="[factorize,consensus,gpu] Storage and matmul dtype for GPU NMF (default auto)")
     group.add_argument("--gpu-allow-tf32", action="store_const", const=True, help="[factorize,consensus,gpu] Allow TF32 for CUDA fp32 matrix multiplication")
-    group.add_argument("--gpu-compile", action="store_const", const=True, help="[factorize,consensus,gpu] Enable torch.compile for the GPU NMF update step")
+    group.add_argument("--gpu-compile", action="store_const", const=True, help="[factorize,consensus,gpu] Enable torch.compile for MU (CUDA Fast-HALS is already fused)")
     group.add_argument("--gpu-eps", type=float, help="[factorize,consensus,gpu] Replacement for exactly-zero MU denominators")
     group.add_argument("--gpu-check-every", type=int, help="[factorize,consensus,gpu] Eager-mode convergence check interval")
     group.add_argument("--gpu-compile-block", type=int, help="[factorize,consensus,gpu] Number of MU iterations per compiled block")
-    group.add_argument("--gpu-batch", type=int, help="[factorize] Replicates run per GPU launch (batched MU); 1 = single-replicate")
+    group.add_argument("--gpu-batch", type=int, help="[factorize] Replicates run per GPU launch; 1 = single-replicate")
     return parser
 
 
@@ -302,6 +310,276 @@ def _init_wh(Xnp, k, seed, init):
 
 
 # ---------------------------------------------------------------------
+# Fast-HALS / coordinate-descent helpers
+# ---------------------------------------------------------------------
+
+
+def _numpy_compute_dtype(torch, dtype):
+    """Return the NumPy dtype matching a supported torch compute dtype."""
+    if dtype is torch.float64:
+        return np.float64
+    if dtype is torch.float32:
+        return np.float32
+    raise TypeError("scikit-learn-compatible Fast-HALS supports fp32 and fp64 only")
+
+
+def _to_checked_custom_factor(value, shape, name, dtype):
+    """Validate a custom CD factor and cast it to the selected compute dtype."""
+    if value is None:
+        raise ValueError(f"init='custom' requires {name}")
+    array = value.toarray() if hasattr(value, "toarray") else np.asarray(value)
+    if array.ndim != 2 or array.shape != shape:
+        raise ValueError(f"custom {name} shape must be {shape}; got {array.shape}")
+    if not np.isfinite(array).all():
+        raise ValueError(f"custom {name} contains NaN/inf")
+    if array.size and array.min() < 0:
+        raise ValueError(f"custom {name} must be non-negative")
+    return np.ascontiguousarray(array, dtype=dtype)
+
+
+def _cd_regularization(nmf_kwargs, n_samples, n_features):
+    """Compute the four scaled regularizers used by sklearn's CD solver."""
+    alpha_W = float(nmf_kwargs.get("alpha_W", 0.0))
+    alpha_H_raw = nmf_kwargs.get("alpha_H", "same")
+    alpha_H = alpha_W if alpha_H_raw == "same" else float(alpha_H_raw)
+    l1_ratio = float(nmf_kwargs.get("l1_ratio", 0.0))
+    if alpha_W < 0 or alpha_H < 0:
+        raise ValueError("alpha_W and alpha_H must be non-negative")
+    if not 0.0 <= l1_ratio <= 1.0:
+        raise ValueError("l1_ratio must be in the range [0, 1]")
+    return (
+        n_features * alpha_W * l1_ratio,
+        n_features * alpha_W * (1.0 - l1_ratio),
+        n_samples * alpha_H * l1_ratio,
+        n_samples * alpha_H * (1.0 - l1_ratio),
+    )
+
+
+def _validate_cd_runtime(torch, rc, nmf_kwargs):
+    """Validate options whose sklearn CD semantics differ from MU."""
+    legacy_regularization = {"alpha", "regularization"}.intersection(nmf_kwargs)
+    if legacy_regularization:
+        raise ValueError(
+            "solver='cd' does not accept deprecated alpha/regularization; "
+            "use alpha_W, alpha_H, and l1_ratio"
+        )
+    beta_loss = nmf_kwargs.get("beta_loss", "frobenius")
+    if not (beta_loss == 2 or str(beta_loss).lower() == "frobenius"):
+        raise ValueError("solver='cd' supports only beta_loss='frobenius'")
+    if rc.dtype is torch.bfloat16:
+        raise ValueError("solver='cd' supports gpu dtype fp32 or fp64, not bf16")
+    if rc.opt["allow_tf32"]:
+        raise ValueError(
+            "solver='cd' requires --gpu-allow-tf32 to be disabled for sklearn parity"
+        )
+    if rc.max_iter < 1:
+        raise ValueError("max_iter must be at least 1 for solver='cd'")
+    if rc.tol < 0:
+        raise ValueError("tol must be non-negative for solver='cd'")
+
+
+def _hals_sweep_torch(factor, gram, cross, permutation, active):
+    """Literal torch port of one sklearn CD factor sweep.
+
+    ``factor`` and ``cross`` use layout ``[replicate, component, row]``.
+    Components and the inner gradient sum remain serial; only replicate/row
+    elements are vectorized.  The factor is updated in-place and a violation
+    value is returned for each replicate.
+    """
+    replicates, components, rows = factor.shape
+    violation = factor.new_zeros(replicates)
+    zero = factor.new_zeros(())
+
+    cyclic = permutation is None
+    for coordinate in range(components):
+        if cyclic:
+            component = coordinate
+            gram_row = gram[:, component, :]
+            cross_row = cross[:, component, :]
+            old_value = factor[:, component, :].clone()
+        else:
+            component = permutation[:, coordinate]
+            gram_row = gram.gather(
+                1, component[:, None, None].expand(-1, 1, components)
+            ).squeeze(1)
+            factor_index = component[:, None, None].expand(-1, 1, rows)
+            cross_row = cross.gather(1, factor_index).squeeze(1)
+            old_value = factor.gather(1, factor_index).squeeze(1)
+
+        # Match _cdnmf_fast.pyx: grad starts at -XHt and accumulates r=0..k-1.
+        gradient = -cross_row.clone()
+        for other_component in range(components):
+            gradient = (
+                gradient
+                + gram_row[:, other_component, None]
+                * factor[:, other_component, :]
+            )
+
+        projected_gradient = gradient.where(
+            old_value != 0, zero.minimum(gradient)
+        )
+        violation = violation + projected_gradient.abs().sum(dim=1) * active
+
+        if cyclic:
+            hessian = gram[:, component, component, None]
+        else:
+            hessian = gram_row.gather(1, component[:, None])
+        nonzero_hessian = hessian != 0
+        safe_hessian = hessian.where(
+            nonzero_hessian, hessian.new_ones(())
+        )
+        candidate = (old_value - gradient / safe_hessian).clamp_min(0)
+        new_value = candidate.where(nonzero_hessian, old_value)
+        new_value = new_value.where(active[:, None], old_value)
+
+        if cyclic:
+            factor[:, component, :] = new_value
+        else:
+            factor.scatter_(1, factor_index, new_value[:, None, :])
+
+    return violation
+
+
+_HALS_CUDA_BACKEND_UNSET = object()
+_HALS_CUDA_BACKEND = _HALS_CUDA_BACKEND_UNSET
+
+
+def _get_hals_cuda_backend():
+    """Resolve and cache the optional fused CUDA backend once per process."""
+    global _HALS_CUDA_BACKEND
+    if _HALS_CUDA_BACKEND is _HALS_CUDA_BACKEND_UNSET:
+        try:
+            from .nmf_hals_cuda import hals_sweep_cuda
+        except (ImportError, ModuleNotFoundError):
+            try:
+                from cnmf.nmf_hals_cuda import hals_sweep_cuda
+            except (ImportError, ModuleNotFoundError):
+                hals_sweep_cuda = None
+        _HALS_CUDA_BACKEND = hals_sweep_cuda
+    return _HALS_CUDA_BACKEND
+
+
+def _hals_sweep(factor, gram, cross, permutation, active):
+    """Use the fused CUDA sweep when available, otherwise the literal torch port."""
+    if factor.is_cuda:
+        hals_sweep_cuda = _get_hals_cuda_backend()
+        if hals_sweep_cuda is not None:
+            if permutation is None:
+                permutation = factor.new_tensor(
+                    np.tile(
+                        np.arange(factor.shape[1], dtype=np.int64),
+                        (factor.shape[0], 1),
+                    ),
+                    dtype=None,
+                ).long()
+            return hals_sweep_cuda(
+                factor, gram, cross, permutation, active
+            )
+    return _hals_sweep_torch(factor, gram, cross, permutation, active)
+
+
+def _regularize_cd_products(gram, cross, l1_reg, l2_reg):
+    """Apply sklearn CD's L2 diagonal addition and L1 cross-product shift."""
+    if l2_reg != 0.0:
+        gram.diagonal(dim1=-2, dim2=-1).add_(l2_reg)
+    if l1_reg != 0.0:
+        cross.sub_(l1_reg)
+    return gram, cross
+
+
+def _fit_cd(
+    torch,
+    Xg,
+    Wt,
+    H,
+    max_iter,
+    tol,
+    update_H,
+    regularization,
+    shuffle,
+    seeds,
+    tf32,
+    device,
+):
+    """Run batched Fast-HALS with sklearn's per-replicate stopping rule."""
+    if Xg.dtype != Wt.dtype or Xg.dtype != H.dtype:
+        raise RuntimeError(
+            "NMF runtime tensors must share dtype; got "
+            f"{sorted(map(str, {Xg.dtype, Wt.dtype, H.dtype}))}"
+        )
+
+    replicates, components, _ = Wt.shape
+    active = torch.ones(replicates, dtype=torch.bool, device=device)
+    n_iter = torch.zeros(replicates, dtype=torch.int64, device=device)
+    violation_init = Wt.new_zeros(replicates)
+    l1_W, l2_W, l1_H, l2_H = regularization
+
+    if shuffle:
+        try:
+            from sklearn.utils import check_random_state
+        except ModuleNotFoundError as e:
+            raise RuntimeError("scikit-learn is required for shuffled CD") from e
+        rngs = [check_random_state(seed) for seed in seeds]
+        cyclic_permutation = None
+    else:
+        rngs = None
+        # The fused CUDA kernel needs an explicit permutation tensor. Build it
+        # once per fit rather than transferring the same tiny tensor twice per
+        # iteration. CPU/MPS retain the direct-slice fast path represented by None.
+        cyclic_permutation = (
+            torch.arange(components, dtype=torch.int64, device=device)
+            .expand(replicates, -1)
+            .contiguous()
+            if Xg.is_cuda and _get_hals_cuda_backend() is not None
+            else None
+        )
+
+    def next_permutation():
+        if rngs is None:
+            return cyclic_permutation
+        values = np.stack(
+            [rng.permutation(components) for rng in rngs], axis=0
+        ).astype(np.int64, copy=False)
+        return torch.as_tensor(values, dtype=torch.int64, device=device)
+
+    with torch.no_grad(), _cuda_tf32(torch, tf32, device):
+        for iteration in range(1, max_iter + 1):
+            gram = H @ H.transpose(-2, -1)
+            cross = H @ Xg.transpose(-2, -1)
+            gram, cross = _regularize_cd_products(gram, cross, l1_W, l2_W)
+            violation = _hals_sweep(
+                Wt, gram, cross, next_permutation(), active
+            )
+
+            if update_H:
+                gram = Wt @ Wt.transpose(-2, -1)
+                cross = Wt @ Xg
+                gram, cross = _regularize_cd_products(
+                    gram, cross, l1_H, l2_H
+                )
+                violation = violation + _hals_sweep(
+                    H, gram, cross, next_permutation(), active
+                )
+
+            n_iter = n_iter.new_full((), iteration).where(active, n_iter)
+            if iteration == 1:
+                violation_init = violation.clone()
+
+            zero_init = violation_init == 0
+            denominator = violation_init.where(
+                ~zero_init, violation_init.new_ones(())
+            )
+            converged = active & (
+                zero_init | ((violation / denominator) <= tol)
+            )
+            active = active & ~converged
+            if not bool(active.any()):
+                break
+
+    return Wt, H, n_iter
+
+
+# ---------------------------------------------------------------------
 # Multiplicative-update steppers (one MU iteration; batch-aware)
 # ---------------------------------------------------------------------
 
@@ -525,10 +803,151 @@ def _nmf_gpu_fixed_h(X, seeds, nmf_kwargs, gpu_kwargs=None):
     return [(Hc, Wc[r]) for r in range(len(seeds))]
 
 
+def _nmf_gpu_cd(
+    X,
+    seeds,
+    nmf_kwargs,
+    gpu_kwargs=None,
+    return_usages=True,
+    return_n_iter=False,
+):
+    """Run same-X, same-k sklearn-compatible Fast-HALS replicates.
+
+    Replicates are initialized independently and stacked only along the new
+    batch dimension.  With ``update_H=False``, CD follows sklearn by ignoring
+    any supplied W and starting usages at exact zeros.
+    """
+    torch = _loud_import_torch()
+
+    seeds = [None if seed is None else int(seed) for seed in seeds]
+    if not seeds:
+        raise ValueError("seeds must be a non-empty list of per-replicate random states")
+
+    rc = _gpu_setup(torch, X, nmf_kwargs, gpu_kwargs)
+    _validate_cd_runtime(torch, rc, nmf_kwargs)
+    np_dtype = _numpy_compute_dtype(torch, rc.dtype)
+    Xcompute = np.ascontiguousarray(rc.Xnp, dtype=np_dtype)
+    Xg = torch.as_tensor(Xcompute, dtype=rc.dtype, device=rc.device)
+    replicates = len(seeds)
+    update_H = nmf_kwargs.get("update_H", True) is not False
+
+    if update_H:
+        init = nmf_kwargs.get("init")
+        if init == "custom":
+            W0 = _to_checked_custom_factor(
+                nmf_kwargs.get("W"),
+                (Xcompute.shape[0], rc.k),
+                "W",
+                np_dtype,
+            )
+            H0 = _to_checked_custom_factor(
+                nmf_kwargs.get("H"),
+                (rc.k, Xcompute.shape[1]),
+                "H",
+                np_dtype,
+            )
+            Wt0 = np.repeat(W0.T[None, :, :], replicates, axis=0)
+            Hs0 = np.repeat(H0[None, :, :], replicates, axis=0)
+        else:
+            # Preallocate rather than list+stack: at R=100 the usages tensor is
+            # multiple GiB and a second full host copy is avoidable.
+            Wt0 = np.empty(
+                (replicates, rc.k, Xcompute.shape[0]), dtype=np_dtype
+            )
+            Hs0 = np.empty(
+                (replicates, rc.k, Xcompute.shape[1]), dtype=np_dtype
+            )
+            for replicate, seed in enumerate(seeds):
+                W0, H0 = _init_wh(Xcompute, rc.k, seed, init)
+                Wt0[replicate] = W0.T
+                Hs0[replicate] = H0
+        Wt = torch.as_tensor(Wt0, dtype=rc.dtype, device=rc.device)
+        H = torch.as_tensor(Hs0, dtype=rc.dtype, device=rc.device)
+        del Wt0, Hs0, W0, H0
+    else:
+        H0 = _to_checked_fixed_h(
+            nmf_kwargs.get("H"), rc.k, Xcompute.shape[1]
+        )
+        H0 = np.ascontiguousarray(H0, dtype=np_dtype)
+        # This is deliberately zeros, not random initialization: it is the
+        # fixed-H CD contract in sklearn's NMF._check_w_h.
+        Wt = torch.zeros(
+            (replicates, rc.k, Xcompute.shape[0]),
+            dtype=rc.dtype,
+            device=rc.device,
+        )
+        H = (
+            torch.as_tensor(H0, dtype=rc.dtype, device=rc.device)
+            .unsqueeze(0)
+            .expand(replicates, -1, -1)
+            .contiguous()
+        )
+
+    regularization = _cd_regularization(
+        nmf_kwargs, Xcompute.shape[0], Xcompute.shape[1]
+    )
+    Wt, H, n_iter = _fit_cd(
+        torch,
+        Xg,
+        Wt,
+        H,
+        rc.max_iter,
+        rc.tol,
+        update_H,
+        regularization,
+        bool(nmf_kwargs.get("shuffle", False)),
+        seeds,
+        False,  # TF32 is rejected above; full fp32 arithmetic matches sklearn.
+        rc.device,
+    )
+
+    Hc = H.cpu().double().numpy()
+    if return_usages:
+        Wc = Wt.transpose(-2, -1).cpu().double().numpy()
+        results = [(Hc[r], Wc[r]) for r in range(replicates)]
+    else:
+        # cNMF factorize writes only spectra, so do not copy a potentially
+        # multi-GiB batched usages tensor back to host merely to discard it.
+        results = [(Hc[r], None) for r in range(replicates)]
+
+    if return_n_iter:
+        return results, n_iter.cpu().numpy()
+    return results
+
+
+def _nmf_gpu_batch(
+    X, seeds, nmf_kwargs, gpu_kwargs=None, return_usages=True
+):
+    """Dispatch a batch using the solver persisted by cNMF prepare."""
+    solver = str(
+        nmf_kwargs.get("solver", DEFAULT_NMF["solver"])
+    ).lower()
+    if solver == "mu":
+        kernel = (
+            _nmf_gpu_fixed_h
+            if nmf_kwargs.get("update_H", True) is False
+            else _nmf_gpu_mu
+        )
+        return kernel(X, seeds, nmf_kwargs, gpu_kwargs)
+    if solver == "cd":
+        return _nmf_gpu_cd(
+            X,
+            seeds,
+            nmf_kwargs,
+            gpu_kwargs,
+            return_usages=return_usages,
+        )
+    raise ValueError("solver must be 'mu' or 'cd'")
+
+
 def _nmf_gpu(X, nmf_kwargs, gpu_kwargs=None):
-    """Single-replicate NMF API; dispatches to full MU or fixed-H refit."""
-    kernel = _nmf_gpu_fixed_h if nmf_kwargs.get("update_H", True) is False else _nmf_gpu_mu
-    (result,) = kernel(X, [nmf_kwargs.get("random_state")], nmf_kwargs, gpu_kwargs)
+    """Single-replicate NMF API; dispatch by solver and fixed-H mode."""
+    (result,) = _nmf_gpu_batch(
+        X,
+        [nmf_kwargs.get("random_state")],
+        nmf_kwargs,
+        gpu_kwargs,
+    )
     return result
 
 
@@ -602,7 +1021,13 @@ def factorize_gpu(cnmf_obj, gpu_kwargs, worker_i=0, total_workers=1, skip_comple
             seeds = [s for _, s in chunk]
             print('[Worker %d]. k=%d: launching %d replicate(s), iters=%s.'
                   % (worker_i, k, len(chunk), iters))
-            results = _nmf_gpu_mu(X_dense, seeds, run_kwargs, gpu_kwargs)
+            results = _nmf_gpu_batch(
+                X_dense,
+                seeds,
+                run_kwargs,
+                gpu_kwargs,
+                return_usages=False,
+            )
             for (spectra, _usages), it in zip(results, iters):
                 spectra = pd.DataFrame(spectra, index=np.arange(1, k + 1), columns=genes)
                 save_df_to_npz(spectra, cnmf_obj.paths['iter_spectra'] % (k, it))

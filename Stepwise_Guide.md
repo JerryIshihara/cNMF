@@ -30,6 +30,7 @@ Parameters
   - --total-workers - specifies how many workers (e.g. cores on a machine or nodes on a compute farm) can be used in parallel. Default: `1`
   - --seed - the master seed that will be used to generate the individual seed for each NMF replicate. Default: `None`
   - --numgenes - the number of highest variance genes that will be used for running the factorization. Removing low variance genes helps amplify the signal and is an important factor in correctly inferring programs in the data. However, don't worry, at the end the spectra is re-fit to include estimates for all genes, even those that weren't included in the high-variance set. Default: 2000
+  - --solver - NMF solver, either multiplicative update (`mu`) or Fast-HALS coordinate descent (`cd`). Default: `mu`. CD requires `--beta-loss frobenius`
   - --beta-loss - Loss function for NMF, from one of `frobenius`, `kullback-leibler`, `itakura-saito`. Default: `frobenius`
   - --densify -- Flag indicating that unlike most single-cell RNA-Seq data, the input data is not sparse. Causes the data to be treated as dense. Not recommended for most single-cell RNA-Seq data Default: `False`
 
@@ -48,6 +49,10 @@ Next NMF is run for all of the replicates specified in the previous command. The
 ```
 cnmf factorize --output-dir ./example_data --name example_cNMF --worker-index 0 
 ```
+
+To run the solver on a GPU and parallelize independent replicates in one
+launch, add for example `--engine gpu --gpu-device cuda --gpu-dtype fp32
+--gpu-batch 8`. The solver itself was selected and cached during `prepare`.
 
 This is running all of the jobs for worker 1. If you specified a single worker in the prepare step (--total-workers 1) like in the command above, this will run all of the factorizations. However, if you specified more than 1 total worker, you would need to run the commands for those workers as well with separate commands, E.g.:
 

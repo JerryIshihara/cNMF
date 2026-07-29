@@ -79,7 +79,11 @@ def test_cnmf_end_to_end(cnmf_instance, dataset_config, tmp_path):
         components=dataset_config["k_values"],
         n_iter=dataset_config["n_iter"],
         num_highvar_genes=dataset_config["nhvg"],
-        seed=dataset_config["seed"]
+        seed=dataset_config["seed"],
+        # These historical fixtures were generated with cNMF's former
+        # Frobenius -> CD implicit selection. Keep that solver explicit now
+        # that new runs intentionally default to MU.
+        solver="cd",
     )
 
     #Rather than re-running factorization, we simply copy the combined files 
