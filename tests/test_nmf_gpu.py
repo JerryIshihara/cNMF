@@ -756,6 +756,39 @@ def test_fast_hals_batched_convergence_iterations_match_sklearn(kernel):
     )
 
 
+def test_fast_hals_reports_per_replicate_convergence_metrics(kernel):
+    """Expose each seed's stopping iteration, status, and elapsed checkpoint."""
+    require_nmf_runtime()
+    X = np.random.default_rng(64).random((31, 17)) + 0.1
+    seeds = [0, 7, 103]
+    max_iter = 200
+    nmf_kwargs = _cd_nmf_kwargs(
+        4,
+        seed=0,
+        max_iter=max_iter,
+        tol=1e-4,
+        alpha_W=0.0,
+        alpha_H=0.0,
+        l1_ratio=0.0,
+    )
+
+    results, metrics = kernel._nmf_gpu_cd(
+        X,
+        seeds,
+        nmf_kwargs,
+        {"device": "cpu", "dtype": "fp64", "allow_tf32": False},
+        return_metrics=True,
+    )
+
+    assert len(results) == len(metrics) == len(seeds)
+    assert [metric["seed"] for metric in metrics] == seeds
+    for metric in metrics:
+        assert 1 <= metric["n_iter"] <= max_iter
+        assert isinstance(metric["converged"], bool)
+        assert np.isfinite(metric["fit_seconds"])
+        assert metric["fit_seconds"] > 0
+
+
 def test_fast_hals_batched_shuffle_matches_sklearn(kernel):
     """Shuffled CD must use sklearn's per-seed permutation stream."""
     require_nmf_runtime()
@@ -832,7 +865,6 @@ def test_nmf_gpu_batch_rejects_unknown_solver(kernel):
         ({"beta_loss": "kullback-leibler"}, {}, "beta_loss"),
         ({"tol": -1.0}, {}, "tol"),
         ({"alpha": 0.1}, {}, "alpha_W"),
-        ({}, {"allow_tf32": True}, "TF32|tf32"),
     ],
 )
 def test_fast_hals_rejects_options_that_break_sklearn_cd_semantics(
@@ -855,6 +887,53 @@ def test_fast_hals_rejects_options_that_break_sklearn_cd_semantics(
             nmf_kwargs,
             gpu_kwargs,
         )
+
+
+def test_fast_hals_tf32_request_is_inactive_off_cuda(kernel, monkeypatch):
+    """An explicit TF32 request must remain a no-op outside CUDA fp32."""
+    require_nmf_runtime()
+    captured = []
+    real_fit_cd = kernel._fit_cd
+
+    def capture_tf32(*args, **kwargs):
+        captured.append(args[-2])
+        return real_fit_cd(*args, **kwargs)
+
+    monkeypatch.setattr(kernel, "_fit_cd", capture_tf32)
+    kernel._nmf_gpu_cd(
+        small_nonnegative_matrix(cells=8, genes=6),
+        [7],
+        _cd_nmf_kwargs(2, seed=7, max_iter=2),
+        {"device": "cpu", "dtype": "fp32", "allow_tf32": True},
+    )
+
+    assert captured == [False]
+
+
+def test_fast_hals_tf32_reaches_fit_loop_on_cuda_fp32_when_available(
+    kernel, monkeypatch
+):
+    """An explicit CUDA-fp32 TF32 request must reach the Fast-HALS fit loop."""
+    torch = require_nmf_runtime()
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    captured = []
+    real_fit_cd = kernel._fit_cd
+
+    def capture_tf32(*args, **kwargs):
+        captured.append(args[-2])
+        return real_fit_cd(*args, **kwargs)
+
+    monkeypatch.setattr(kernel, "_fit_cd", capture_tf32)
+    kernel._nmf_gpu_cd(
+        small_nonnegative_matrix(cells=8, genes=6).astype(np.float32),
+        [7],
+        _cd_nmf_kwargs(2, seed=7, max_iter=2),
+        {"device": "cuda", "dtype": "fp32", "allow_tf32": True},
+    )
+
+    assert captured == [True]
 
 
 @pytest.mark.parametrize("dtype_name,np_dtype,rtol,atol", CD_PARITY_CASES)

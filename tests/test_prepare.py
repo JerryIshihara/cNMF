@@ -255,7 +255,7 @@ def test_cd_rejects_non_frobenius_loss(mock_cnmf):
 
 @pytest.mark.parametrize("solver, expected_backend", [("mu", "mu"), ("cd", "cd")])
 def test_factorize_gpu_dispatches_saved_solver(
-    mock_cnmf, monkeypatch, tmp_path, solver, expected_backend
+    mock_cnmf, monkeypatch, tmp_path, capsys, solver, expected_backend
 ):
     """GPU factorize dispatches every same-k batch from the solver cached by prepare."""
     counts_fn = generate_counts_file(tmp_path, "npz", np.float64)
@@ -274,10 +274,21 @@ def test_factorize_gpu_dispatches_saved_solver(
         def run(X, seeds, nmf_kwargs, gpu_kwargs=None, **_backend_kwargs):
             calls.append((name, [int(seed) for seed in seeds], dict(nmf_kwargs)))
             k = int(nmf_kwargs["n_components"])
-            return [
+            results = [
                 (np.zeros((k, X.shape[1])), np.zeros((X.shape[0], k)))
                 for _ in seeds
             ]
+            if _backend_kwargs.get("return_metrics"):
+                return results, [
+                    {
+                        "seed": int(seed),
+                        "n_iter": 7,
+                        "converged": True,
+                        "fit_seconds": 0.25,
+                    }
+                    for seed in seeds
+                ]
+            return results
 
         return run
 
@@ -297,6 +308,18 @@ def test_factorize_gpu_dispatches_saved_solver(
     assert len(seeds) == 2
     assert run_params["solver"] == solver
     assert run_params["n_components"] == 5
+    if solver == "cd":
+        for iter_i in range(2):
+            metrics_path = (
+                mock_cnmf.paths["iter_spectra"] % (5, iter_i)
+            ).replace(".spectra.", ".factorize_metrics.")
+            metrics = load_df_from_npz(metrics_path)
+            assert metrics.loc[0, "n_iter"] == 7
+            assert metrics.loc[0, "converged"] == 1
+            assert metrics.loc[0, "allow_tf32"] == 0
+        output = capsys.readouterr().out
+        assert output.count("HALS_REPLICATE") == 2
+        assert "status=converged" in output
 
 
 def test_factorize_gpu_engine_passes_seed_components_run_params_and_gpu_kwargs(mock_cnmf, monkeypatch, tmp_path):

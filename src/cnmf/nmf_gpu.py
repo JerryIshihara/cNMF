@@ -18,10 +18,12 @@ for this kernel; bf16 is explicit CUDA-only storage and matmul. The implementati
 supports batched same-k replicates for factorize and fixed-H consensus refits.
 Fast-HALS batches only independent replicates/rows; its component updates,
 projected-gradient stopping rule, regularization, and exact Hessian guard follow
-scikit-learn coordinate descent.
+scikit-learn coordinate descent. Optional TF32 accelerates CUDA fp32 matrix
+products but relaxes strict numerical parity with sklearn.
 """
 import contextlib
 import functools
+import time
 from collections import namedtuple
 
 import numpy as np
@@ -69,7 +71,7 @@ def parse_gpu_args(parser):
     group.add_argument("--engine", type=str.lower, choices=["cpu", "gpu"], help="[factorize,consensus] NMF engine to use (default cpu)")
     group.add_argument("--gpu-device", type=str, help="[factorize,consensus,gpu] Device for GPU NMF: auto, cpu, cuda, cuda:N, or mps")
     group.add_argument("--gpu-dtype", type=str.lower, choices=["auto", "fp32", "fp64", "bf16"], help="[factorize,consensus,gpu] Storage and matmul dtype for GPU NMF (default auto)")
-    group.add_argument("--gpu-allow-tf32", action="store_const", const=True, help="[factorize,consensus,gpu] Allow TF32 for CUDA fp32 matrix multiplication")
+    group.add_argument("--gpu-allow-tf32", action="store_const", const=True, help="[factorize,consensus,gpu] Allow TF32 for CUDA fp32 matrix multiplication (relaxes strict sklearn CD parity)")
     group.add_argument("--gpu-compile", action="store_const", const=True, help="[factorize,consensus,gpu] Enable torch.compile for MU (CUDA Fast-HALS is already fused)")
     group.add_argument("--gpu-eps", type=float, help="[factorize,consensus,gpu] Replacement for exactly-zero MU denominators")
     group.add_argument("--gpu-check-every", type=int, help="[factorize,consensus,gpu] Eager-mode convergence check interval")
@@ -368,10 +370,6 @@ def _validate_cd_runtime(torch, rc, nmf_kwargs):
         raise ValueError("solver='cd' supports only beta_loss='frobenius'")
     if rc.dtype is torch.bfloat16:
         raise ValueError("solver='cd' supports gpu dtype fp32 or fp64, not bf16")
-    if rc.opt["allow_tf32"]:
-        raise ValueError(
-            "solver='cd' requires --gpu-allow-tf32 to be disabled for sklearn parity"
-        )
     if rc.max_iter < 1:
         raise ValueError("max_iter must be at least 1 for solver='cd'")
     if rc.tol < 0:
@@ -501,7 +499,7 @@ def _fit_cd(
     tf32,
     device,
 ):
-    """Run batched Fast-HALS with sklearn's per-replicate stopping rule."""
+    """Run batched Fast-HALS and report each replicate's stopping checkpoint."""
     if Xg.dtype != Wt.dtype or Xg.dtype != H.dtype:
         raise RuntimeError(
             "NMF runtime tensors must share dtype; got "
@@ -542,6 +540,8 @@ def _fit_cd(
         ).astype(np.int64, copy=False)
         return torch.as_tensor(values, dtype=torch.int64, device=device)
 
+    fit_started = time.perf_counter()
+    iteration_elapsed_seconds = []
     with torch.no_grad(), _cuda_tf32(torch, tf32, device):
         for iteration in range(1, max_iter + 1):
             gram = H @ H.transpose(-2, -1)
@@ -573,10 +573,12 @@ def _fit_cd(
                 zero_init | ((violation / denominator) <= tol)
             )
             active = active & ~converged
-            if not bool(active.any()):
+            has_active = bool(active.any())
+            iteration_elapsed_seconds.append(time.perf_counter() - fit_started)
+            if not has_active:
                 break
 
-    return Wt, H, n_iter
+    return Wt, H, n_iter, ~active, iteration_elapsed_seconds
 
 
 # ---------------------------------------------------------------------
@@ -810,6 +812,7 @@ def _nmf_gpu_cd(
     gpu_kwargs=None,
     return_usages=True,
     return_n_iter=False,
+    return_metrics=False,
 ):
     """Run same-X, same-k sklearn-compatible Fast-HALS replicates.
 
@@ -886,7 +889,7 @@ def _nmf_gpu_cd(
     regularization = _cd_regularization(
         nmf_kwargs, Xcompute.shape[0], Xcompute.shape[1]
     )
-    Wt, H, n_iter = _fit_cd(
+    Wt, H, n_iter, converged, iteration_elapsed_seconds = _fit_cd(
         torch,
         Xg,
         Wt,
@@ -897,10 +900,19 @@ def _nmf_gpu_cd(
         regularization,
         bool(nmf_kwargs.get("shuffle", False)),
         seeds,
-        False,  # TF32 is rejected above; full fp32 arithmetic matches sklearn.
+        _want_tf32(torch, rc),
         rc.device,
     )
 
+    n_iter_numpy = n_iter.cpu().numpy()
+    converged_numpy = converged.cpu().numpy()
+    fit_seconds = np.asarray(
+        [
+            iteration_elapsed_seconds[int(iteration) - 1]
+            for iteration in n_iter_numpy
+        ],
+        dtype=np.float64,
+    )
     Hc = H.cpu().double().numpy()
     if return_usages:
         Wc = Wt.transpose(-2, -1).cpu().double().numpy()
@@ -910,19 +922,42 @@ def _nmf_gpu_cd(
         # multi-GiB batched usages tensor back to host merely to discard it.
         results = [(Hc[r], None) for r in range(replicates)]
 
+    if return_metrics:
+        metrics = [
+            {
+                "seed": seed,
+                "n_iter": int(iterations),
+                "converged": bool(did_converge),
+                "fit_seconds": float(seconds),
+            }
+            for seed, iterations, did_converge, seconds in zip(
+                seeds, n_iter_numpy, converged_numpy, fit_seconds
+            )
+        ]
+        return results, metrics
     if return_n_iter:
-        return results, n_iter.cpu().numpy()
+        return results, n_iter_numpy
     return results
 
 
 def _nmf_gpu_batch(
-    X, seeds, nmf_kwargs, gpu_kwargs=None, return_usages=True
+    X,
+    seeds,
+    nmf_kwargs,
+    gpu_kwargs=None,
+    return_usages=True,
+    return_metrics=False,
 ):
     """Dispatch a batch using the solver persisted by cNMF prepare."""
     solver = str(
         nmf_kwargs.get("solver", DEFAULT_NMF["solver"])
     ).lower()
     if solver == "mu":
+        if return_metrics:
+            raise ValueError(
+                "per-replicate convergence metrics are currently available "
+                "only for solver='cd'"
+            )
         kernel = (
             _nmf_gpu_fixed_h
             if nmf_kwargs.get("update_H", True) is False
@@ -936,6 +971,7 @@ def _nmf_gpu_batch(
             nmf_kwargs,
             gpu_kwargs,
             return_usages=return_usages,
+            return_metrics=return_metrics,
         )
     raise ValueError("solver must be 'mu' or 'cd'")
 
@@ -985,14 +1021,15 @@ def nmf_gpu(self, X, nmf_kwargs):
 
 
 def factorize_gpu(cnmf_obj, gpu_kwargs, worker_i=0, total_workers=1, skip_completed_runs=False):
-    """GPU `factorize` drop-in: group worker jobs by k, batch seeds, write iter spectra."""
+    """Batch same-k GPU runs and persist spectra plus CD convergence metrics."""
     import scanpy as sc
     import yaml
     import pandas as pd
     from collections import OrderedDict
     from .cnmf import load_df_from_npz, save_df_to_npz, worker_filter
 
-    batch = _resolve_gpu_opts(gpu_kwargs)["batch"]
+    gpu_options = _resolve_gpu_opts(gpu_kwargs)
+    batch = gpu_options["batch"]
 
     run_params  = load_df_from_npz(cnmf_obj.paths['nmf_replicate_parameters'])
     norm_counts = sc.read(cnmf_obj.paths['normalized_counts'])
@@ -1021,13 +1058,63 @@ def factorize_gpu(cnmf_obj, gpu_kwargs, worker_i=0, total_workers=1, skip_comple
             seeds = [s for _, s in chunk]
             print('[Worker %d]. k=%d: launching %d replicate(s), iters=%s.'
                   % (worker_i, k, len(chunk), iters))
-            results = _nmf_gpu_batch(
-                X_dense,
-                seeds,
-                run_kwargs,
-                gpu_kwargs,
-                return_usages=False,
-            )
-            for (spectra, _usages), it in zip(results, iters):
+            batch_started = time.perf_counter()
+            if str(run_kwargs.get("solver", DEFAULT_NMF["solver"])).lower() == "cd":
+                results, metrics = _nmf_gpu_batch(
+                    X_dense,
+                    seeds,
+                    run_kwargs,
+                    gpu_kwargs,
+                    return_usages=False,
+                    return_metrics=True,
+                )
+            else:
+                results = _nmf_gpu_batch(
+                    X_dense,
+                    seeds,
+                    run_kwargs,
+                    gpu_kwargs,
+                    return_usages=False,
+                )
+                metrics = None
+            batch_seconds = time.perf_counter() - batch_started
+
+            for replicate, ((spectra, _usages), it) in enumerate(
+                zip(results, iters)
+            ):
                 spectra = pd.DataFrame(spectra, index=np.arange(1, k + 1), columns=genes)
                 save_df_to_npz(spectra, cnmf_obj.paths['iter_spectra'] % (k, it))
+                if metrics is None:
+                    continue
+
+                metric = metrics[replicate]
+                status = "converged" if metric["converged"] else "max_iter"
+                metrics_path = (
+                    cnmf_obj.paths['iter_spectra'] % (k, it)
+                ).replace(".spectra.", ".factorize_metrics.")
+                metrics_frame = pd.DataFrame(
+                    {
+                        "worker": [int(worker_i)],
+                        "n_components": [int(k)],
+                        "iter": [int(it)],
+                        "nmf_seed": [int(metric["seed"])],
+                        "n_iter": [int(metric["n_iter"])],
+                        "converged": [int(metric["converged"])],
+                        "fit_seconds": [float(metric["fit_seconds"])],
+                        "batch_seconds": [float(batch_seconds)],
+                        "batch_size": [len(chunk)],
+                        "allow_tf32": [int(gpu_options["allow_tf32"])],
+                    }
+                )
+                save_df_to_npz(metrics_frame, metrics_path)
+                print(
+                    "HALS_REPLICATE "
+                    f"worker={worker_i} k={k} iter={it} "
+                    f"seed={metric['seed']} status={status} "
+                    f"n_iter={metric['n_iter']} "
+                    f"fit_seconds={metric['fit_seconds']:.6f} "
+                    f"batch_seconds={batch_seconds:.6f} "
+                    f"batch_size={len(chunk)} "
+                    f"tf32={str(gpu_options['allow_tf32']).lower()}",
+                    flush=True,
+                )
