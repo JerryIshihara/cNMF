@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from types import SimpleNamespace
+import importlib
 import importlib.util
 import json
 import os
@@ -18,18 +19,21 @@ import pytest
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-KERNEL_PATH = REPO_ROOT / "src" / "cnmf" / "nmf_gpu.py"
+KERNEL_PATH = REPO_ROOT / "src" / "cnmf" / "gpunmf" / "__init__.py"
 DOWNLOAD_PYTEST_DATA_PATH = REPO_ROOT / "download_pytest_data.py"
 
 
 # ---------------------------------------------------------------------
 # Standalone NMF GPU kernel helpers
 # ---------------------------------------------------------------------
-def load_kernel_module(module_name="nmf_gpu", kernel_path=KERNEL_PATH):
-    """Load the standalone kernel script as an importable module for tests."""
+def load_kernel_module(module_name="cnmf.gpunmf", kernel_path=KERNEL_PATH):
+    """Load the GPU engine through its real package import path."""
     kernel_path = Path(kernel_path)
     if not kernel_path.exists():
         pytest.fail(f"Required NMF GPU kernel file is missing: {kernel_path}", pytrace=False)
+
+    if kernel_path.resolve() == KERNEL_PATH.resolve():
+        return importlib.import_module("cnmf.gpunmf")
 
     if module_name in sys.modules:
         return sys.modules[module_name]
@@ -46,7 +50,7 @@ def load_kernel_module(module_name="nmf_gpu", kernel_path=KERNEL_PATH):
 
 @pytest.fixture(scope="session")
 def kernel():
-    """Loaded `src/cnmf/nmf_gpu.py` module under test."""
+    """Loaded `cnmf.gpunmf` package module under test."""
     return load_kernel_module()
 
 

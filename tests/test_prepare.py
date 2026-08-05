@@ -3,9 +3,12 @@ import numpy as np
 import pandas as pd
 import scanpy as sc
 import os
+import sys
 import scipy.sparse as sp
+import yaml
+from types import SimpleNamespace
 from cnmf import cNMF, save_df_to_npz, load_df_from_npz
-from cnmf import nmf_gpu
+import cnmf.gpunmf as gpunmf
 
 # Global parameters for data simulation
 NUM_CELLS = 100
@@ -17,6 +20,34 @@ SEED = 42
 @pytest.fixture
 def mock_cnmf(tmp_path):
     return cNMF(output_dir=str(tmp_path), name="test")
+
+
+def configure_gpu(cnmf_obj, *, command="factorize", solver="mu",
+                  beta_loss="frobenius", gpu_kwargs=None):
+    """Configure an existing test instance through the CLI-shaped GPU adapter."""
+    gpu_kwargs = dict(gpu_kwargs or {})
+    args = SimpleNamespace(
+        command=command,
+        output_dir=cnmf_obj.output_dir,
+        name=cnmf_obj.name,
+        engine="gpu",
+        solver=solver,
+        beta_loss=beta_loss,
+        gpu_device=gpu_kwargs.get("device"),
+        gpu_dtype=gpu_kwargs.get("dtype"),
+        gpu_allow_tf32=gpu_kwargs.get("allow_tf32"),
+        gpu_compile=gpu_kwargs.get("compile"),
+        gpu_eps=gpu_kwargs.get("eps"),
+        gpu_check_every=gpu_kwargs.get("check_every"),
+        gpu_compile_block=gpu_kwargs.get("compile_block"),
+        gpu_batch=gpu_kwargs.get("batch"),
+    )
+    configured = gpunmf.configure_nmf_engine(
+        lambda output_dir, name: cnmf_obj,
+        args,
+    )
+    return configured, args
+
 
 def generate_counts_file(tmp_path, file_format, dtype=np.int64, zero_count=False):
     """
@@ -97,9 +128,120 @@ def test_prepare_raises_on_zero_count_cells(mock_cnmf, file_format, dtype, densi
         mock_cnmf.prepare(counts_fn, components=[5, 10], n_iter=10, densify=densify)
 
 
+@pytest.mark.parametrize("solver", ["mu", "cd"])
+def test_main_prepare_persists_cli_solver(tmp_path, monkeypatch, solver):
+    """The CLI solver should flow through prepare into the saved run parameters."""
+    from cnmf.cnmf import main
+
+    counts_fn = generate_counts_file(tmp_path, "npz", np.float64)
+    output_dir = tmp_path / "cli-output"
+    run_name = f"solver-test-{solver}"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cnmf",
+            "prepare",
+            "--output-dir",
+            str(output_dir),
+            "--name",
+            run_name,
+            "--counts",
+            counts_fn,
+            "--components",
+            "5",
+            "--n-iter",
+            "2",
+            "--numgenes",
+            "50",
+            "--densify",
+            "--engine",
+            "gpu",
+            "--solver",
+            solver,
+        ],
+    )
+
+    main()
+
+    params_path = output_dir / run_name / "cnmf_tmp" / f"{run_name}.nmf_idvrun_params.yaml"
+    with open(params_path, encoding="utf-8") as stream:
+        assert yaml.safe_load(stream)["solver"] == solver
+
+
+def test_gpunmf_prepare_solver_changes_only_saved_run_config(tmp_path):
+    """Selecting MU instead of CD must not change the matrix prepared by cNMF."""
+    counts_fn = generate_counts_file(tmp_path, "npz", np.float64)
+    prepared = {}
+
+    for solver in ("mu", "cd"):
+        cnmf_obj = cNMF(output_dir=str(tmp_path), name=f"prepared-{solver}")
+        cnmf_obj, _args = configure_gpu(
+            cnmf_obj,
+            command="prepare",
+            solver=solver,
+        )
+        cnmf_obj.prepare(
+            counts_fn,
+            components=[5],
+            n_iter=2,
+            densify=True,
+            seed=14,
+            num_highvar_genes=50,
+        )
+        normalized = sc.read(cnmf_obj.paths["normalized_counts"])
+        with open(cnmf_obj.paths["nmf_run_parameters"], encoding="utf-8") as stream:
+            run_parameters = yaml.safe_load(stream)
+        prepared[solver] = (normalized, run_parameters)
+
+    mu_counts, mu_parameters = prepared["mu"]
+    cd_counts, cd_parameters = prepared["cd"]
+    np.testing.assert_array_equal(mu_counts.X, cd_counts.X)
+    assert mu_counts.obs_names.equals(cd_counts.obs_names)
+    assert mu_counts.var_names.equals(cd_counts.var_names)
+    assert mu_parameters.pop("solver") == "mu"
+    assert cd_parameters.pop("solver") == "cd"
+    assert mu_parameters == cd_parameters
+
+
+def test_main_rejects_cd_with_non_frobenius_before_creating_run(tmp_path, monkeypatch):
+    """Invalid CLI solver/loss combinations should have no filesystem side effects."""
+    from cnmf.cnmf import main
+
+    output_dir = tmp_path / "cli-output"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cnmf",
+            "prepare",
+            "--output-dir",
+            str(output_dir),
+            "--name",
+            "must-not-exist",
+            "--engine",
+            "gpu",
+            "--solver",
+            "cd",
+            "--beta-loss",
+            "kullback-leibler",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        main()
+
+    assert not (output_dir / "must-not-exist").exists()
+
+
 def test_configure_nmf_engine_gpu_factorize_groups_by_k_and_writes_each_replicate(mock_cnmf, monkeypatch, tmp_path):
     """GPU factorize groups by k, batches seeds, and writes one spectra file per replicate."""
     counts_fn = generate_counts_file(tmp_path, "npz", np.float64)
+    mock_cnmf, _args = configure_gpu(
+        mock_cnmf,
+        solver="mu",
+        gpu_kwargs={"device": "cpu", "batch": 2},
+    )
     mock_cnmf.prepare(counts_fn, components=[5, 7], n_iter=3, densify=True)
 
     calls = []
@@ -109,9 +251,8 @@ def test_configure_nmf_engine_gpu_factorize_groups_by_k_and_writes_each_replicat
         calls.append((k, [int(s) for s in seeds]))
         return [(np.zeros((k, X.shape[1])), np.zeros((X.shape[0], k))) for _ in seeds]
 
-    monkeypatch.setattr(nmf_gpu, "_nmf_gpu_mu", fake_mu)
+    monkeypatch.setitem(gpunmf._GPU_SOLVERS, "mu", fake_mu)
 
-    nmf_gpu.configure_nmf_engine(mock_cnmf, engine="gpu", gpu_kwargs={"device": "cpu", "batch": 2})
     mock_cnmf.factorize(worker_i=0, total_workers=1)
 
     # Two k-values x three replicates, chunked by batch=2 -> four launches.
@@ -133,6 +274,11 @@ def test_configure_nmf_engine_gpu_factorize_groups_by_k_and_writes_each_replicat
 def test_configure_nmf_engine_installs_gpu_factorize_at_default_batch_1(mock_cnmf, monkeypatch, tmp_path):
     """Default GPU factorize uses batch=1: one seed per `_nmf_gpu_mu` launch."""
     counts_fn = generate_counts_file(tmp_path, "npz", np.float64)
+    mock_cnmf, _args = configure_gpu(
+        mock_cnmf,
+        solver="mu",
+        gpu_kwargs={"device": "cpu"},
+    )
     mock_cnmf.prepare(counts_fn, components=[6], n_iter=2, densify=True)
 
     calls = []
@@ -142,9 +288,8 @@ def test_configure_nmf_engine_installs_gpu_factorize_at_default_batch_1(mock_cnm
         k = int(nmf_kwargs["n_components"])
         return [(np.zeros((k, X.shape[1])), np.zeros((X.shape[0], k))) for _ in seeds]
 
-    monkeypatch.setattr(nmf_gpu, "_nmf_gpu_mu", fake_mu)
+    monkeypatch.setitem(gpunmf._GPU_SOLVERS, "mu", fake_mu)
 
-    nmf_gpu.configure_nmf_engine(mock_cnmf, engine="gpu", gpu_kwargs={"device": "cpu"})
     mock_cnmf.factorize(worker_i=0, total_workers=1)
 
     assert len(calls) == 2
@@ -209,13 +354,53 @@ def test_get_nmf_iter_params_default_cpu_engine_does_not_change_sklearn_kwargs(m
     assert set(run_params) == {"alpha_W", "alpha_H", "l1_ratio", "beta_loss", "solver", "tol", "max_iter", "init"}
 
 
+def test_get_nmf_iter_params_retains_upstream_solver_inference(mock_cnmf):
+    """The unwrapped cNMF helper should retain its upstream loss-based behavior."""
+    _replicate_params, frobenius_params = mock_cnmf.get_nmf_iter_params(
+        ks=[5], n_iter=2, beta_loss="frobenius"
+    )
+    _replicate_params, kl_params = mock_cnmf.get_nmf_iter_params(
+        ks=[5], n_iter=2, beta_loss="kullback-leibler"
+    )
+
+    assert frobenius_params["solver"] == "cd"
+    assert kl_params["solver"] == "mu"
+
+
+def test_gpunmf_prepare_validates_solver_before_reading_counts(mock_cnmf, tmp_path):
+    """The adapter should reject an invalid solver/loss before constructing cNMF."""
+
+    with pytest.raises(
+        ValueError,
+        match="solver='cd' supports only beta_loss='frobenius'",
+    ):
+        configure_gpu(
+            mock_cnmf,
+            command="prepare",
+            solver="cd",
+            beta_loss="kullback-leibler",
+        )
+
+
 def test_factorize_gpu_engine_passes_seed_components_run_params_and_gpu_kwargs(mock_cnmf, monkeypatch, tmp_path):
     """factorize_gpu should hand each replicate's seed, n_components, forwarded run params, and the
     resolved GPU kwargs to the batch kernel _nmf_gpu_mu (default batch=1 -> one seed per launch)."""
-    import cnmf.nmf_gpu as gpu_mod
+    import cnmf.gpunmf as gpu_mod
 
     counts_fn = generate_counts_file(tmp_path, "txt", np.int64)
-    mock_cnmf.prepare(counts_fn, components=[5], n_iter=2, densify=True, seed=14)
+    gpu_kwargs = {"device": "cpu", "dtype": "fp64"}
+    mock_cnmf, _args = configure_gpu(
+        mock_cnmf,
+        solver="mu",
+        gpu_kwargs=gpu_kwargs,
+    )
+    mock_cnmf.prepare(
+        counts_fn,
+        components=[5],
+        n_iter=2,
+        densify=True,
+        seed=14,
+    )
 
     captured = []
 
@@ -224,9 +409,7 @@ def test_factorize_gpu_engine_passes_seed_components_run_params_and_gpu_kwargs(m
         k = int(nmf_kwargs["n_components"])
         return [(np.zeros((k, X.shape[1])), np.zeros((X.shape[0], k))) for _ in seeds]
 
-    monkeypatch.setattr(gpu_mod, "_nmf_gpu_mu", fake_mu)
-    gpu_kwargs = {"device": "cpu", "dtype": "fp64"}
-    gpu_mod.configure_nmf_engine(mock_cnmf, engine="gpu", gpu_kwargs=gpu_kwargs)
+    monkeypatch.setitem(gpu_mod._GPU_SOLVERS, "mu", fake_mu)
 
     mock_cnmf.factorize(worker_i=0, total_workers=1)
 
@@ -238,7 +421,7 @@ def test_factorize_gpu_engine_passes_seed_components_run_params_and_gpu_kwargs(m
         assert len(seeds) == 1                         # default batch=1 -> one seed per launch
         assert kw["n_components"] == 5                 # set per k by factorize
         assert "beta_loss" in kw and "init" in kw      # original run params forwarded
-        assert gk == gpu_kwargs                        # resolved GPU kwargs passed through
+        assert gk == gpu_mod.utils._resolve_gpu_opts(gpu_kwargs)
         observed_seeds.update(seeds)
     assert observed_seeds == expected_seeds            # exact seeds from prepared replicate params
     for iter_i in replicate_params["iter"]:
@@ -247,7 +430,7 @@ def test_factorize_gpu_engine_passes_seed_components_run_params_and_gpu_kwargs(m
 
 def test_refit_usage_gpu_engine_passes_fixed_h_update_h_false_and_gpu_kwargs(mock_cnmf, monkeypatch, tmp_path):
     """cNMF refit_usage should route fixed-H consensus refits through the GPU adapter."""
-    import cnmf.nmf_gpu as gpu_mod
+    import cnmf.gpunmf as gpu_mod
 
     write_minimal_nmf_run_params(mock_cnmf)
     X = pd.DataFrame(
@@ -262,24 +445,24 @@ def test_refit_usage_gpu_engine_passes_fixed_h_update_h_false_and_gpu_kwargs(moc
     )
     captured = []
 
-    def fake_nmf_gpu(self, X_arg, nmf_kwargs):
-        captured.append((X_arg, dict(nmf_kwargs)))
+    def fake_nmf_gpu(args, X_arg, nmf_kwargs, gpu_kwargs=None):
+        captured.append((X_arg, dict(nmf_kwargs), gpu_mod.utils.gpu_kwargs_from_args(args)))
         return fake_gpu_nmf_output(X_arg, nmf_kwargs)
 
-    monkeypatch.setattr(gpu_mod, "nmf_gpu", fake_nmf_gpu)
+    monkeypatch.setattr(gpu_mod, "_nmf_gpu", fake_nmf_gpu)
     gpu_kwargs = {"device": "cpu", "dtype": "fp64"}
-    gpu_mod.configure_nmf_engine(mock_cnmf, engine="gpu", gpu_kwargs=gpu_kwargs)
+    mock_cnmf, _args = configure_gpu(mock_cnmf, gpu_kwargs=gpu_kwargs)
 
     usages = mock_cnmf.refit_usage(X, spectra)
 
     assert len(captured) == 1
-    X_arg, kw = captured[0]
+    X_arg, kw, actual_gpu_kwargs = captured[0]
     assert X_arg is X
     assert kw["n_components"] == 2
     assert np.allclose(kw["H"], spectra.values)
     assert kw["update_H"] is False
-    assert kw["engine"] == "gpu"
-    assert kw["gpu"] == gpu_kwargs
+    assert "engine" not in kw and "gpu" not in kw
+    assert actual_gpu_kwargs == gpu_mod.utils._resolve_gpu_opts(gpu_kwargs)
     assert "beta_loss" in kw and "init" in kw
     assert list(usages.index) == list(X.index)
     assert list(usages.columns) == list(spectra.index)
@@ -288,7 +471,7 @@ def test_refit_usage_gpu_engine_passes_fixed_h_update_h_false_and_gpu_kwargs(moc
 
 def test_refit_spectra_gpu_engine_routes_through_transposed_refit_usage(mock_cnmf, monkeypatch, tmp_path):
     """cNMF refit_spectra should use the same GPU fixed-H path through transposed refit_usage."""
-    import cnmf.nmf_gpu as gpu_mod
+    import cnmf.gpunmf as gpu_mod
 
     write_minimal_nmf_run_params(mock_cnmf)
     X = pd.DataFrame(
@@ -303,17 +486,20 @@ def test_refit_spectra_gpu_engine_routes_through_transposed_refit_usage(mock_cnm
     )
     captured = []
 
-    def fake_nmf_gpu(self, X_arg, nmf_kwargs):
-        captured.append((X_arg, dict(nmf_kwargs)))
+    def fake_nmf_gpu(args, X_arg, nmf_kwargs, gpu_kwargs=None):
+        captured.append((X_arg, dict(nmf_kwargs), gpu_mod.utils.gpu_kwargs_from_args(args)))
         return fake_gpu_nmf_output(X_arg, nmf_kwargs)
 
-    monkeypatch.setattr(gpu_mod, "nmf_gpu", fake_nmf_gpu)
-    gpu_mod.configure_nmf_engine(mock_cnmf, engine="gpu", gpu_kwargs={"device": "cpu", "dtype": "fp64"})
+    monkeypatch.setattr(gpu_mod, "_nmf_gpu", fake_nmf_gpu)
+    mock_cnmf, _args = configure_gpu(
+        mock_cnmf,
+        gpu_kwargs={"device": "cpu", "dtype": "fp64"},
+    )
 
     spectra = mock_cnmf.refit_spectra(X, usage)
 
     assert len(captured) == 1
-    X_arg, kw = captured[0]
+    X_arg, kw, _ = captured[0]
     assert X_arg.shape == (3, 4)                       # genes x cells after transpose
     assert np.allclose(kw["H"], usage.T.values)        # programs x cells fixed H
     assert kw["update_H"] is False
@@ -325,7 +511,7 @@ def test_refit_spectra_gpu_engine_routes_through_transposed_refit_usage(mock_cnm
 
 def test_consensus_gpu_engine_smoke_writes_expected_outputs(mock_cnmf, monkeypatch, tmp_path):
     """A tiny CPU-backed GPU-engine consensus run should write the expected consensus outputs."""
-    import cnmf.nmf_gpu as gpu_mod
+    import cnmf.gpunmf as gpu_mod
 
     counts_fn = generate_positive_counts_file(tmp_path)
     mock_cnmf.prepare(counts_fn, components=[2], n_iter=3, densify=True,
@@ -349,11 +535,15 @@ def test_consensus_gpu_engine_smoke_writes_expected_outputs(mock_cnmf, monkeypat
     )
     save_df_to_npz(merged, mock_cnmf.paths["merged_spectra"] % 2)
 
-    def fake_nmf_gpu(self, X_arg, nmf_kwargs):
+    def fake_nmf_gpu(args, X_arg, nmf_kwargs, gpu_kwargs=None):
         return fake_gpu_nmf_output(X_arg, nmf_kwargs)
 
-    monkeypatch.setattr(gpu_mod, "nmf_gpu", fake_nmf_gpu)
-    gpu_mod.configure_nmf_engine(mock_cnmf, engine="gpu", gpu_kwargs={"device": "cpu", "dtype": "fp64"})
+    monkeypatch.setattr(gpu_mod, "_nmf_gpu", fake_nmf_gpu)
+    mock_cnmf, _args = configure_gpu(
+        mock_cnmf,
+        command="consensus",
+        gpu_kwargs={"device": "cpu", "dtype": "fp64"},
+    )
 
     mock_cnmf.consensus(k=2, density_threshold=2.0, local_neighborhood_size=0.5,
                         show_clustering=False, refit_usage=False)
