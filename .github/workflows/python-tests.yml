@@ -1,6 +1,8 @@
 name: Python tests
 
 on:
+  # Includes direct pushes and merge commits pushed to the target branch.
+  push:
   pull_request:
 
 jobs:

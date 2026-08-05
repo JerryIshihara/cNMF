@@ -378,8 +378,8 @@ class cNMF():
         max_NMF_iter : int, optional (default=1000)
             Maximum number of iterations per individual NMF run
         """
-        
-        
+
+
         if counts_fn.endswith('.h5ad'):
             input_counts = sc.read(counts_fn)
         elif counts_fn.endswith('.mtx') or counts_fn.endswith('.mtx.gz'):
@@ -626,7 +626,7 @@ class cNMF():
                         init=init
                         )
         
-        ## Coordinate descent is faster than multiplicative update but only works for frobenius
+        # Coordinate descent is faster than multiplicative update but only works for frobenius
         if beta_loss == 'frobenius':
             _nmf_kwargs['solver'] = 'cd'
 
@@ -1234,10 +1234,7 @@ def main():
     """
 
     import sys, argparse
-    try:
-        from cnmf.nmf_gpu import configure_nmf_engine, gpu_kwargs_from_args, parse_gpu_args, validate_engine_args_for_command
-    except ImportError:
-        from nmf_gpu import configure_nmf_engine, gpu_kwargs_from_args, parse_gpu_args, validate_engine_args_for_command
+    from cnmf.gpunmf import configure_nmf_engine
 
     parser = argparse.ArgumentParser()
 
@@ -1253,6 +1250,7 @@ def main():
     parser.add_argument('--numgenes', type=int, help='[prepare] Number of high variance genes to use for matrix factorization.', default=2000)
     parser.add_argument('--tpm', type=str, help='[prepare] Pre-computed (cell x gene) TPM values as df.npz or tab separated txt file. If not provided TPM will be calculated automatically', default=None)
     parser.add_argument('--max-nmf-iter', type=int, help='[prepare] Max number of iterations per individual NMF run (default 1000)', default=1000)
+    parser.add_argument('--solver', type=str.lower, choices=['mu', 'cd'], help='[prepare] NMF solver to persist for factorization; cd requires Frobenius loss (default cd)', default='cd')
     parser.add_argument('--beta-loss', type=str, choices=['frobenius', 'kullback-leibler', 'itakura-saito'], help='[prepare] Loss function for NMF (default frobenius)', default='frobenius')
     parser.add_argument('--init', type=str, choices=['random', 'nndsvd'], help='[prepare] Initialization algorithm for NMF (default random)', default='random')
     parser.add_argument('--densify', dest='densify', help='[prepare] Treat the input data as non-sparse (default False)', action='store_true', default=False) 
@@ -1262,18 +1260,24 @@ def main():
     parser.add_argument('--local-neighborhood-size', type=float, help='[consensus] Fraction of the number of replicates to use as nearest neighbors for local density filtering', default=0.30)
     parser.add_argument('--show-clustering', dest='show_clustering', help='[consensus] Produce a clustergram figure summarizing the spectra clustering', action='store_true')
     parser.add_argument('--build-reference', dest='build_reference', help='[consensus] Generates a reference spectra for use in starCAT', action='store_true', default=True)
-    parse_gpu_args(parser)
 
     
-    args = parser.parse_args()
-    try:
-        engine_commands = ('factorize', 'consensus')
-        validate_engine_args_for_command(args, engine_commands)
-    except ValueError as e:
-        parser.error(str(e))
+    parser.add_argument("--engine", type=str.lower, choices=["cpu", "gpu"], help="[factorize,consensus] NMF engine to use (default cpu)", default="cpu")
+    parser.add_argument("--gpu-device", type=str, help="[factorize,consensus,gpu] Device for GPU NMF: auto, cpu, cuda, cuda:N, or mps")
+    parser.add_argument("--gpu-dtype", type=str.lower, choices=["auto", "fp32", "fp64", "bf16"], help="[factorize,consensus,gpu] Storage and matmul dtype for GPU NMF (default auto)")
+    parser.add_argument("--gpu-allow-tf32", action="store_const", const=True, help="[factorize,consensus,gpu] Allow TF32 for CUDA fp32 matrix multiplication")
+    parser.add_argument("--gpu-compile", action="store_const", const=True, help="[factorize,consensus,gpu] Enable torch.compile for the MU update step")
+    parser.add_argument("--gpu-eps", type=float, help="[factorize,consensus,gpu] Replacement for exactly-zero MU denominators")
+    parser.add_argument("--gpu-check-every", type=int, help="[factorize,consensus,gpu] Eager-mode convergence check interval")
+    parser.add_argument("--gpu-compile-block", type=int, help="[factorize,consensus,gpu] Number of MU iterations per compiled block")
+    parser.add_argument("--gpu-batch", type=int, help="[factorize] Replicates run per GPU solver launch; 1 = single-replicate")
 
-    cnmf_obj = cNMF(output_dir=args.output_dir, name=args.name)
-    cnmf_obj = configure_nmf_engine(cnmf_obj, engine=args.engine or 'cpu', gpu_kwargs=gpu_kwargs_from_args(args))
+    args = parser.parse_args()
+
+    try:
+        cnmf_obj = configure_nmf_engine(cNMF, args)
+    except ValueError as exc:
+        parser.error(str(exc))
     
     if args.command == 'prepare':
         cnmf_obj.prepare(args.counts, components=args.components, n_iter=args.n_iter, densify=args.densify,
