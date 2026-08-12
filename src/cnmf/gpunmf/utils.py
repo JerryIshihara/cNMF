@@ -12,7 +12,7 @@ DEFAULT_NMF = {
     "max_iter": 1000,
     "tol": 1e-4,
     "init": "random",
-    "solver": "mu",
+    "solver": "cd",
 }
 
 
@@ -25,6 +25,7 @@ DEFAULT_GPU = {
     "check_every": 10,
     "compile_block": 1,
     "batch": 1,
+    "row_tiling_ratio": None,
 }
 
 
@@ -38,6 +39,7 @@ GPU_ARG_NAMES = (
     "gpu_check_every",
     "gpu_compile_block",
     "gpu_batch",
+    "gpu_row_tiling_ratio",
 )
 
 
@@ -92,6 +94,7 @@ def gpu_kwargs_from_args(args):
         "check_every": args.gpu_check_every,
         "compile_block": args.gpu_compile_block,
         "batch": args.gpu_batch,
+        "row_tiling_ratio": args.gpu_row_tiling_ratio,
     }
     if args.engine != "gpu":
         if any(value is not None for value in raw.values()):
@@ -115,6 +118,9 @@ def _resolve_gpu_opts(gpu_kwargs):
     def parse_positive_int(value, default):
         return max(1, parse_typed(value, default, int))
 
+    def parse_optional_tiling_ratio(value):
+        return None if value is None else _validate_row_tiling_ratio(value)
+
     return dict(
         device        = parse_typed(raw.get("device"), DEFAULT_GPU["device"], str, str.lower),
         dtype         = parse_typed(raw.get("dtype"), DEFAULT_GPU["dtype"], str, str.lower),
@@ -124,7 +130,91 @@ def _resolve_gpu_opts(gpu_kwargs):
         check_every   = parse_positive_int(raw.get("check_every"), DEFAULT_GPU["check_every"]),
         compile_block = parse_positive_int(raw.get("compile_block"), DEFAULT_GPU["compile_block"]),
         batch         = parse_positive_int(raw.get("batch"), DEFAULT_GPU["batch"]),
+        row_tiling_ratio = parse_optional_tiling_ratio(raw.get("row_tiling_ratio")),
     )
+
+
+# ---------------------------------------------------------------------
+# GPU row tiling
+# ---------------------------------------------------------------------
+
+
+_MIB = 1 << 20
+
+
+def _validate_row_tiling_ratio(value):
+    """Return a finite configured row ratio in the interval (0, 1]."""
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "gpu row tiling ratio must be a finite number in (0, 1]"
+        ) from None
+    if not np.isfinite(ratio) or not 0 < ratio <= 1:
+        raise ValueError(
+            "gpu row tiling ratio must be a finite number in (0, 1]"
+        )
+    return ratio
+
+
+def _check_row_batch(row_batch, n_rows):
+    """Validate and cap a resolved row batch."""
+    if row_batch < 1 or n_rows < 1:
+        raise ValueError("gpu row batch and row count must be at least 1")
+    return min(n_rows, row_batch)
+
+
+def resolve_row_batch(
+    torch,
+    device,
+    Xcompute,
+    replicates,
+    n_components,
+    *,
+    configured_ratio=None,
+    reserve_bytes=512 * _MIB,
+    reserve_fraction=0.10,
+):
+    """Resolve a configured row ratio or automatically size one from VRAM."""
+    n_rows, _n_features = Xcompute.shape
+    if n_rows < 1:
+        raise ValueError("fixed-H input must contain at least one row")
+
+    if configured_ratio is not None:
+        tiling_ratio = _validate_row_tiling_ratio(configured_ratio)
+        row_batch = max(1, int(n_rows * tiling_ratio))
+        return _check_row_batch(row_batch, n_rows), tiling_ratio
+
+    tiling_ratio = 1.0
+    if str(device).split(":", 1)[0] == "cuda":
+        if reserve_bytes < 0 or not 0 <= reserve_fraction < 1:
+            raise ValueError("invalid VRAM reserve")
+        free_vram_bytes, _ = torch.cuda.mem_get_info(device)
+        factor_bytes = (
+            replicates
+            * n_components
+            * n_rows
+            * Xcompute.dtype.itemsize
+        )
+        required_bytes = Xcompute.nbytes + 2 * factor_bytes
+        reserve = max(
+            reserve_bytes,
+            int(free_vram_bytes * reserve_fraction),
+        )
+        usable_vram_bytes = max(0, free_vram_bytes - reserve)
+        if required_bytes > usable_vram_bytes:
+            bytes_per_row = (required_bytes + n_rows - 1) // n_rows
+            if usable_vram_bytes < bytes_per_row:
+                raise MemoryError(
+                    "GPU fixed-H CD does not have enough VRAM for one row"
+                )
+            portions = (
+                required_bytes + usable_vram_bytes - 1
+            ) // usable_vram_bytes
+            tiling_ratio = 1 / portions
+
+    row_batch = max(1, int(n_rows * tiling_ratio))
+    return _check_row_batch(row_batch, n_rows), tiling_ratio
 
 
 # ---------------------------------------------------------------------

@@ -18,7 +18,7 @@ def _hals_sweep_kernel(
     cross,
     permutation,
     active,
-    block_violation,
+    row_violation,
     M: tl.constexpr,
     K: tl.constexpr,
     N_BLOCKS: tl.constexpr,
@@ -87,14 +87,15 @@ def _hals_sweep_kernel(
         )
 
     tl.store(
-        block_violation
-        + replicate_offset * N_BLOCKS
-        + row_block.to(tl.int64),
-        tl.sum(violation, axis=0),
+        row_violation + replicate_offset * M + rows_offset,
+        violation,
+        mask=row_mask,
     )
 
 
-def hals_sweep_cuda(factor, gram, cross, permutation, active):
+def hals_sweep_cuda(
+    factor, gram, cross, permutation, active, return_row_violation=False
+):
     """Update one factor in place and return violation per replicate."""
     if not factor.is_cuda:
         raise ValueError("hals_sweep_cuda requires CUDA tensors")
@@ -135,7 +136,7 @@ def hals_sweep_cuda(factor, gram, cross, permutation, active):
 
     block = 128
     n_blocks = triton.cdiv(rows, block)
-    block_violation = factor.new_empty((replicates, n_blocks))
+    row_violation = factor.new_empty((replicates, rows))
     grid = (replicates * n_blocks,)
     _hals_sweep_kernel[grid](
         factor,
@@ -143,7 +144,7 @@ def hals_sweep_cuda(factor, gram, cross, permutation, active):
         cross,
         permutation,
         active,
-        block_violation,
+        row_violation,
         M=rows,
         K=components,
         N_BLOCKS=n_blocks,
@@ -151,4 +152,6 @@ def hals_sweep_cuda(factor, gram, cross, permutation, active):
         IS_FP64=factor.element_size() == 8,
         num_warps=4,
     )
-    return block_violation.sum(dim=1)
+    if return_row_violation:
+        return row_violation
+    return row_violation.sum(dim=1)
