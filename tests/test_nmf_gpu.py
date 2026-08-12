@@ -679,8 +679,9 @@ def test_cd_batched_seeds_match_independent_runs(
 
 
 @pytest.mark.parametrize("dtype_name,np_dtype,rtol,atol", CD_PARITY_CASES)
+@pytest.mark.parametrize("row_tiling_ratio", [None, 0.5])
 def test_sklearn_cd_fixed_h_matches_batched_gpu_refit(
-    kernel, dtype_name, np_dtype, rtol, atol
+    kernel, dtype_name, np_dtype, rtol, atol, row_tiling_ratio
 ):
     """Fixed-H CD must keep H and use sklearn's exact-zero W start."""
     require_nmf_runtime()
@@ -700,6 +701,7 @@ def test_sklearn_cd_fixed_h_matches_batched_gpu_refit(
         "dtype": dtype_name,
         "allow_tf32": False,
         "compile": False,
+        "row_tiling_ratio": row_tiling_ratio,
     }
 
     actual = kernel.solver_cd._nmf_gpu_cd(X, seeds, nmf_kwargs, gpu_kwargs)
@@ -713,6 +715,88 @@ def test_sklearn_cd_fixed_h_matches_batched_gpu_refit(
         np.testing.assert_allclose(
             actual_W, expected_W, rtol=rtol, atol=atol
         )
+
+
+@pytest.mark.parametrize("dtype_name,np_dtype,rtol,atol", CD_PARITY_CASES)
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("max_iter", [1, 9])
+@pytest.mark.parametrize("row_tiling_ratio", [0.25, 0.5])
+def test_cd_fixed_h_row_tiling_matches_untiled(
+    kernel, dtype_name, np_dtype, rtol, atol, device, max_iter,
+    row_tiling_ratio, monkeypatch,
+):
+    """Tiled and untiled fixed-H refits must be bitwise identical."""
+    torch = require_nmf_runtime()
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(137)
+    X = rng.random((257, 11), dtype=np_dtype) + np_dtype(0.1)
+    fixed_H = rng.random((4, 11), dtype=np_dtype) + np_dtype(0.1)
+    seeds = [7, 43]
+    nmf_kwargs = _cd_nmf_kwargs(
+        4,
+        seed=0,
+        max_iter=max_iter,
+        update_H=False,
+        H=fixed_H,
+    )
+    gpu_kwargs = {
+        "device": device,
+        "dtype": dtype_name,
+        "allow_tf32": False,
+        "compile": False,
+    }
+
+    convergence_iterations = []
+    sweep_rows = []
+    original_fit = kernel.solver_cd._fit_cd_fixed_h_tiled
+    original_sweep = kernel.solver_cd._hals_sweep
+
+    def capture_iterations(*args, **kwargs):
+        result = original_fit(*args, **kwargs)
+        convergence_iterations.append(result[1].cpu().numpy().copy())
+        return result
+
+    monkeypatch.setattr(
+        kernel.solver_cd,
+        "_fit_cd_fixed_h_tiled",
+        capture_iterations,
+    )
+
+    def capture_sweep(factor, *args, **kwargs):
+        sweep_rows.append(factor.shape[-1])
+        return original_sweep(factor, *args, **kwargs)
+
+    monkeypatch.setattr(kernel.solver_cd, "_hals_sweep", capture_sweep)
+
+    untiled = kernel.solver_cd._nmf_gpu_cd(
+        X,
+        seeds,
+        nmf_kwargs,
+        dict(gpu_kwargs, row_tiling_ratio=1.0),
+    )
+    untiled_sweep_count = len(sweep_rows)
+    tiled = kernel.solver_cd._nmf_gpu_cd(
+        X,
+        seeds,
+        nmf_kwargs,
+        dict(gpu_kwargs, row_tiling_ratio=row_tiling_ratio),
+    )
+
+    expected_row_batch = int(X.shape[0] * row_tiling_ratio)
+    tiled_sweep_rows = sweep_rows[untiled_sweep_count:]
+    assert tiled_sweep_rows[0] == expected_row_batch
+    assert max(tiled_sweep_rows) <= expected_row_batch
+
+    for (untiled_H, untiled_W), (tiled_H, tiled_W) in zip(
+        untiled, tiled
+    ):
+        np.testing.assert_array_equal(tiled_H, untiled_H)
+        np.testing.assert_array_equal(tiled_W, untiled_W)
+    np.testing.assert_array_equal(
+        convergence_iterations[1], convergence_iterations[0]
+    )
+
 
 
 def test_sklearn_cd_custom_init_matches_gpu_kernel(kernel):
@@ -1087,6 +1171,7 @@ def test_resolve_gpu_opts_dict_values_override_defaults(kernel):
         "check_every": 7,
         "compile_block": 9,
         "batch": 1,             # not overridden here -> default
+        "row_tiling_ratio": None,
     }
 
 
@@ -1460,24 +1545,24 @@ def test_nmf_gpu_batch_rejects_unknown_solver(kernel):
         )
 
 
-def test_nmf_gpu_batch_defaults_to_mu(kernel, monkeypatch):
-    """Missing solver configuration should route to MU."""
+def test_nmf_gpu_batch_defaults_to_cd(kernel, monkeypatch):
+    """Missing solver configuration should route to CD."""
     calls = []
 
-    def fake_mu(X, seeds, nmf_kwargs, gpu_kwargs=None):
+    def fake_cd(X, seeds, nmf_kwargs, gpu_kwargs=None):
         calls.append((X, seeds, nmf_kwargs, gpu_kwargs))
-        return ["mu-result"]
+        return ["cd-result"]
 
-    monkeypatch.setitem(kernel._GPU_SOLVERS, "mu", fake_mu)
+    monkeypatch.setitem(kernel._GPU_SOLVERS, "cd", fake_cd)
     X = np.ones((3, 2))
     seeds = [7]
     nmf_kwargs = {"n_components": 1}
     gpu_kwargs = {"device": "cpu"}
 
-    assert kernel.utils.DEFAULT_NMF["solver"] == "mu"
+    assert kernel.utils.DEFAULT_NMF["solver"] == "cd"
     assert kernel._nmf_gpu_batch(
         X, seeds, nmf_kwargs, gpu_kwargs
-    ) == ["mu-result"]
+    ) == ["cd-result"]
     assert len(calls) == 1
     actual_X, actual_seeds, actual_kwargs, actual_gpu_kwargs = calls[0]
     assert actual_X is X
@@ -1693,6 +1778,7 @@ def _engine_args(**overrides):
         "gpu_check_every": None,
         "gpu_compile_block": None,
         "gpu_batch": None,
+        "gpu_row_tiling_ratio": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -1713,6 +1799,7 @@ def run_nmf_gpu(kernel, X, nmf_kwargs, gpu_kwargs=None):
         gpu_check_every=gpu_kwargs.get("check_every"),
         gpu_compile_block=gpu_kwargs.get("compile_block"),
         gpu_batch=gpu_kwargs.get("batch"),
+        gpu_row_tiling_ratio=gpu_kwargs.get("row_tiling_ratio"),
     )
     return kernel._nmf_gpu(args, X, nmf_kwargs)
 
@@ -1740,6 +1827,25 @@ def test_gpu_kwargs_from_args_carries_batch_and_fills_its_default(kernel):
     assert kernel.utils.gpu_kwargs_from_args(default_args)["batch"] == 1
 
 
+
+
+
+@pytest.mark.parametrize("ratio", ["0.5", 1.0])
+def test_gpu_kwargs_from_args_accepts_valid_row_tiling_ratio(kernel, ratio):
+    actual = kernel.utils.gpu_kwargs_from_args(
+        _engine_args(engine="gpu", gpu_row_tiling_ratio=ratio)
+    )
+    assert actual["row_tiling_ratio"] == float(ratio)
+
+
+@pytest.mark.parametrize("ratio", [0, -0.1, 1.1, np.nan, np.inf, "bad"])
+def test_gpu_kwargs_from_args_rejects_invalid_row_tiling_ratio(kernel, ratio):
+    with pytest.raises(ValueError, match="row tiling ratio"):
+        kernel.utils.gpu_kwargs_from_args(
+            _engine_args(engine="gpu", gpu_row_tiling_ratio=ratio)
+        )
+
+
 # ---------------------------------------------------------------------
 # CLI parsing, engine wiring, and fixed-H consensus refit (integration)
 # ---------------------------------------------------------------------
@@ -1749,7 +1855,8 @@ def test_engine_args_default_to_none_until_user_selects_an_engine(kernel):
 
     assert args.engine is None
     for name in ("gpu_device", "gpu_dtype", "gpu_allow_tf32", "gpu_compile",
-                 "gpu_eps", "gpu_check_every", "gpu_compile_block", "gpu_batch"):
+                 "gpu_eps", "gpu_check_every", "gpu_compile_block", "gpu_batch",
+                 "gpu_row_tiling_ratio"):
         assert getattr(args, name) is None, f"{name} should default to None"
 
 
@@ -1792,6 +1899,7 @@ def test_gpu_kwargs_from_args_normalizes_cli_overrides(kernel):
         "check_every": 5,
         "compile_block": 100,
         "batch": 1,          # default added; not set on the CLI here
+        "row_tiling_ratio": None,
     }
 
 

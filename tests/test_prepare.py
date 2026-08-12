@@ -41,6 +41,7 @@ def configure_gpu(cnmf_obj, *, command="factorize", solver="mu",
         gpu_check_every=gpu_kwargs.get("check_every"),
         gpu_compile_block=gpu_kwargs.get("compile_block"),
         gpu_batch=gpu_kwargs.get("batch"),
+        gpu_row_tiling_ratio=gpu_kwargs.get("row_tiling_ratio"),
     )
     configured = gpunmf.configure_nmf_engine(
         lambda output_dir, name: cnmf_obj,
@@ -509,6 +510,28 @@ def test_refit_spectra_gpu_engine_routes_through_transposed_refit_usage(mock_cnm
     assert spectra.shape == (2, 3)
 
 
+@pytest.mark.parametrize("row_tiling_ratio", [None, 0.5])
+def test_gpu_consensus_keeps_original_method_and_binds_args_to_nmf(
+    mock_cnmf, row_tiling_ratio
+):
+    """Consensus stays original while `_nmf` retains its parsed GPU arguments."""
+    original_consensus = mock_cnmf.consensus
+    mock_cnmf, args = configure_gpu(
+        mock_cnmf,
+        command="consensus",
+        solver="cd",
+        gpu_kwargs={
+            "device": "cpu",
+            "row_tiling_ratio": row_tiling_ratio,
+        },
+    )
+
+    assert mock_cnmf.consensus == original_consensus
+    assert mock_cnmf._nmf.func is gpunmf._nmf_gpu
+    assert mock_cnmf._nmf.args == (args,)
+    assert gpunmf.utils.gpu_kwargs_from_args(args)["row_tiling_ratio"] == row_tiling_ratio
+
+
 def test_consensus_gpu_engine_smoke_writes_expected_outputs(mock_cnmf, monkeypatch, tmp_path):
     """A tiny CPU-backed GPU-engine consensus run should write the expected consensus outputs."""
     import cnmf.gpunmf as gpu_mod
@@ -535,7 +558,10 @@ def test_consensus_gpu_engine_smoke_writes_expected_outputs(mock_cnmf, monkeypat
     )
     save_df_to_npz(merged, mock_cnmf.paths["merged_spectra"] % 2)
 
+    refit_rows = []
+
     def fake_nmf_gpu(args, X_arg, nmf_kwargs, gpu_kwargs=None):
+        refit_rows.append(X_arg.shape[0])
         return fake_gpu_nmf_output(X_arg, nmf_kwargs)
 
     monkeypatch.setattr(gpu_mod, "_nmf_gpu", fake_nmf_gpu)
@@ -547,6 +573,8 @@ def test_consensus_gpu_engine_smoke_writes_expected_outputs(mock_cnmf, monkeypat
 
     mock_cnmf.consensus(k=2, density_threshold=2.0, local_neighborhood_size=0.5,
                         show_clustering=False, refit_usage=False)
+
+    assert refit_rows
 
     density = "2_0"
     expected_files = [
