@@ -45,7 +45,9 @@ setuptools.setup(
    'numpy',
    'matplotlib',
    'palettable',
+   'seaborn',
    'scipy',
+   'tqdm',
    'pyyaml'
    ],
     extras_require={

@@ -27,6 +27,7 @@ import scanpy as sc
 
 from multiprocessing import Pool 
 
+from cnmf.qc import run_qc
 
 def save_df_to_npz(obj, filename):
     np.savez_compressed(filename, data=obj.values, index=obj.index.values, columns=obj.columns.values)
@@ -1080,6 +1081,21 @@ class cNMF():
                 
         if build_ref:
             self.build_reference(k, density_threshold)
+
+        # Restore original cluster-index alignment after final GEP re-labeling.
+        qc_median_spectra = median_spectra.copy()
+        qc_median_spectra.index = reorder.index
+
+        run_qc(
+            output=os.path.join(self.output_dir, self.name, self.name),
+            prefix=f"k_{k}.dt_{density_threshold}".replace(".", "_"),
+            k=k,
+            reorder=reorder,
+            median_spectra=qc_median_spectra.sort_index(),
+            l2_spectra=l2_spectra,
+            local_density=local_density,
+            kmeans_cluster_labels=kmeans_cluster_labels,
+        )
                 
                 
     def build_reference(self, k, density_threshold=0.5, target_sum=1e6):
