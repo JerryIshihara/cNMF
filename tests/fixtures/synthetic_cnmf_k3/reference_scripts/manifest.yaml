@@ -1,0 +1,6 @@
+scripts:
+  sc_blipper_fba3745/run_qc_cnmf.py:
+    repository: https://github.com/TrynkaLab/sc-blipper.git
+    commit: fba3745343567a3d68980c80dca347c84492e7b8
+    source_path: bin/run_qc_cnmf.py
+    sha256: 7656754f55633e546a67757f2c0514103698c91b345220bfb6b9fac9a8151df8

@@ -1,0 +1,37 @@
+{
+  "fixture": {
+    "name": "synthetic_cnmf_k3",
+    "seed": 20260825,
+    "cells": 36,
+    "genes": 12,
+    "programs": 3,
+    "cell_groups": {
+      "program_1": 14,
+      "program_2": 10,
+      "program_3": 6,
+      "mixed": 6
+    }
+  },
+  "upstream": {
+    "repository": "dylkot/cNMF",
+    "commit": "5dbc5baaa0b9079b55bce554d801caa235a50457",
+    "version": "1.7.1"
+  },
+  "nmf": {
+    "engine": "cpu",
+    "solver": "cd",
+    "beta_loss": "frobenius",
+    "init": "random",
+    "k": 3,
+    "replicates": 30,
+    "max_iter": 50,
+    "density_threshold": 0.1,
+    "local_neighborhood_size": 0.3
+  },
+  "qc_reference": {
+    "repository": "TrynkaLab/sc-blipper",
+    "commit": "fba3745343567a3d68980c80dca347c84492e7b8",
+    "source_path": "bin/run_qc_cnmf.py",
+    "sha256": "7656754f55633e546a67757f2c0514103698c91b345220bfb6b9fac9a8151df8"
+  }
+}

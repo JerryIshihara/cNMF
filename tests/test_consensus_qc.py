@@ -55,6 +55,15 @@ def test_run_qc_matches_run_qc_cnmf_reference_output(tmp_path):
     )
     median_spectra = l2_spectra.groupby(kmeans_cluster_labels).median()
     median_spectra = median_spectra.div(median_spectra.sum(axis=1), axis=0)
+    refit_usages = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0],
+            [0.0, 0.0, 3.0],
+            [1.0, 1.0, 1.0],
+        ]
+    )
+    normalized_counts = refit_usages @ median_spectra.values
     local_density = pd.DataFrame(
         {"local_density": [0.10, 0.20, 0.30, 0.40, 0.50, 0.60]},
         index=l2_spectra.index,
@@ -74,6 +83,8 @@ def test_run_qc_matches_run_qc_cnmf_reference_output(tmp_path):
         l2_spectra=l2_spectra,
         local_density=local_density,
         kmeans_cluster_labels=kmeans_cluster_labels,
+        normalized_counts=normalized_counts,
+        refit_usages=refit_usages,
     )
 
     annotation_path = tmp_path / f"reference.{prefix}.annotation.tsv"
@@ -99,6 +110,9 @@ def test_run_qc_matches_run_qc_cnmf_reference_output(tmp_path):
             "run_davies_bouldin": [0.31744325019893016] * 3,
             "run_median_density": [0.35] * 3,
             "run_mean_density": [0.35] * 3,
+            "run_r2": [1.0] * 3,
+            "run_sse": [0.0] * 3,
+            "run_tss": [3.3251911190193537] * 3,
         }
     )
     pd.testing.assert_frame_equal(
