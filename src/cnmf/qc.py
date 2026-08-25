@@ -138,6 +138,7 @@ def get_r2(X, U, H, log2p1=False, scale=False):
     
     return r2, sse, tss
 
+
 def plot_heatmap(df, outfile, scale_rows=False):
     # df: rows=sources, cols=conditions
     if scale_rows:
@@ -210,11 +211,20 @@ def run_qc(
     l2_spectra,
     local_density,
     kmeans_cluster_labels,
+    normalized_counts,
+    refit_usages,
 ):
     """Calculate and save QC using state already produced by ``consensus``."""
     # local_density contains all spectra, while l2_spectra has already been density-filtered.
     nruns = len(local_density)
     nruns_per_gep = nruns/k
+    if sp.issparse(normalized_counts):
+        normalized_counts = np.asarray(normalized_counts.todense())
+    run_r2, run_sse, run_tss = get_r2(
+        normalized_counts,
+        refit_usages,
+        median_spectra.values,
+    )
 
     #-----------------------------------------------------------------------
     # Calculate how many iterations feed into each GEP    
@@ -258,6 +268,9 @@ def run_qc(
     annotation['run_davies_bouldin'] = davies_bouldin_score(l2_spectra.values, kmeans_cluster_labels)
     annotation['run_median_density'] = np.median(local_density.iloc[:, 0])
     annotation['run_mean_density'] = np.mean(local_density.iloc[:, 0])
+    annotation['run_r2'] = run_r2
+    annotation['run_sse'] = run_sse
+    annotation['run_tss'] = run_tss
 
     annotation.index = range(1, len(annotation)+1)
     annotation = annotation.loc[reorder.index,:]

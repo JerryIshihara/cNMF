@@ -935,6 +935,8 @@ class cNMF():
                     columns = ['stats'])
 
             return(consensus_stats)           
+
+        density_filtered_refit_usages = rf_usages
         
         # Re-order usage by total contribution
         norm_usages = rf_usages.div(rf_usages.sum(axis=1), axis=0)      
@@ -1095,6 +1097,8 @@ class cNMF():
             l2_spectra=l2_spectra,
             local_density=local_density,
             kmeans_cluster_labels=kmeans_cluster_labels,
+            normalized_counts=norm_counts.X,
+            refit_usages=density_filtered_refit_usages.values,
         )
                 
                 
