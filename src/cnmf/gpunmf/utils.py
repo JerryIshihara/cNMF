@@ -25,6 +25,7 @@ DEFAULT_GPU = {
     "check_every": 10,
     "compile_block": 1,
     "batch": 1,
+    "row_tiling_ratio": None,
 }
 
 
@@ -38,6 +39,7 @@ GPU_ARG_NAMES = (
     "gpu_check_every",
     "gpu_compile_block",
     "gpu_batch",
+    "gpu_row_tiling_ratio",
 )
 
 
@@ -49,6 +51,7 @@ def _validate_engine_args(args, available_solvers):
     # sequencial validation of engine args for the given command
     _validate_engine_args_for_command(args)
     _validate_nmf_solver(args.solver, args.beta_loss, available_solvers)
+    _validate_row_tiling_ratio(args.gpu_row_tiling_ratio)
 
 
 def _validate_engine_args_for_command(args, available_commands=("prepare", "factorize", "consensus")):
@@ -57,7 +60,7 @@ def _validate_engine_args_for_command(args, available_commands=("prepare", "fact
     if args.command in available_commands:
         return
 
-    if any(getattr(args, name) is not None for name in GPU_ARG_NAMES):
+    if any(getattr(args, name, None) is not None for name in GPU_ARG_NAMES):
         commands = ", ".join(available_commands)
         raise ValueError(f"NMF engine/GPU options are only valid with: {commands}")
 
@@ -92,6 +95,7 @@ def gpu_kwargs_from_args(args):
         "check_every": args.gpu_check_every,
         "compile_block": args.gpu_compile_block,
         "batch": args.gpu_batch,
+        "row_tiling_ratio": args.gpu_row_tiling_ratio,
     }
     if args.engine != "gpu":
         if any(value is not None for value in raw.values()):
@@ -99,6 +103,19 @@ def gpu_kwargs_from_args(args):
         return None
     return _resolve_gpu_opts(raw)
 
+
+
+def _validate_row_tiling_ratio(value):
+    """None disables tiling; 0 selects automatic sizing; (0, 1] sets a ratio."""
+    if value is None:
+        return None
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("gpu row tiling ratio must be None or a finite number in [0, 1]") from None
+    if not 0 <= ratio <= 1:
+        raise ValueError("gpu row tiling ratio must be None or a finite number in [0, 1]")
+    return ratio
 
 
 def _resolve_gpu_opts(gpu_kwargs):
@@ -115,15 +132,19 @@ def _resolve_gpu_opts(gpu_kwargs):
     def parse_positive_int(value, default):
         return max(1, parse_typed(value, default, int))
 
+    def parse_row_tiling_ratio(value, default):
+        return _validate_row_tiling_ratio(value) if value is not None else default
+
     return dict(
-        device        = parse_typed(raw.get("device"), DEFAULT_GPU["device"], str, str.lower),
-        dtype         = parse_typed(raw.get("dtype"), DEFAULT_GPU["dtype"], str, str.lower),
-        allow_tf32    = parse_bool(raw.get("allow_tf32"), DEFAULT_GPU["allow_tf32"]),
-        compile       = parse_bool(raw.get("compile"), DEFAULT_GPU["compile"]),
-        eps           = parse_typed(raw.get("eps"), DEFAULT_GPU["eps"], float),
-        check_every   = parse_positive_int(raw.get("check_every"), DEFAULT_GPU["check_every"]),
-        compile_block = parse_positive_int(raw.get("compile_block"), DEFAULT_GPU["compile_block"]),
-        batch         = parse_positive_int(raw.get("batch"), DEFAULT_GPU["batch"]),
+        device           = parse_typed(raw.get("device"), DEFAULT_GPU["device"], str, str.lower),
+        dtype            = parse_typed(raw.get("dtype"), DEFAULT_GPU["dtype"], str, str.lower),
+        allow_tf32       = parse_bool(raw.get("allow_tf32"), DEFAULT_GPU["allow_tf32"]),
+        compile          = parse_bool(raw.get("compile"), DEFAULT_GPU["compile"]),
+        eps              = parse_typed(raw.get("eps"), DEFAULT_GPU["eps"], float),
+        check_every      = parse_positive_int(raw.get("check_every"), DEFAULT_GPU["check_every"]),
+        compile_block    = parse_positive_int(raw.get("compile_block"), DEFAULT_GPU["compile_block"]),
+        batch            = parse_positive_int(raw.get("batch"), DEFAULT_GPU["batch"]),
+        row_tiling_ratio = parse_row_tiling_ratio(raw.get("row_tiling_ratio"), DEFAULT_GPU["row_tiling_ratio"]),
     )
 
 

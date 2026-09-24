@@ -1291,6 +1291,7 @@ def main():
     parser.add_argument("--gpu-check-every", type=int, help="[factorize,consensus,gpu] Eager-mode convergence check interval")
     parser.add_argument("--gpu-compile-block", type=int, help="[factorize,consensus,gpu] Number of MU iterations per compiled block")
     parser.add_argument("--gpu-batch", type=int, help="[factorize] Replicates run per GPU solver launch; 1 = single-replicate")
+    parser.add_argument("--gpu-row-tiling-ratio", type=float, help="[factorize,consensus,gpu] CD row tile ratio: omitted or 1 = no tiling; 0 = automatic VRAM sizing; (0, 1) = explicit ratio")
 
     args = parser.parse_args()
 
