@@ -137,9 +137,18 @@ def get_mean_var(X):
 def get_highvar_genes_sparse(expression, expected_fano_threshold=None,
                        minimal_mean=0.5, numgenes=None):
     # Find high variance genes within those cells
-
-    
     gene_mean, gene_var = get_mean_var(expression)
+    return get_highvar_genes_from_stats(
+        gene_mean, gene_var, expected_fano_threshold, minimal_mean, numgenes)
+
+
+def get_highvar_genes_from_stats(gene_mean, gene_var,
+                                expected_fano_threshold=None,
+                                minimal_mean=0.5, numgenes=None):
+    """Apply cNMF's HVG ranking to global gene means and population variances.
+
+    Shared by the sparse in-memory path and chunked sampling statistics.
+    """
     gene_mean = pd.Series(gene_mean)
     gene_var = pd.Series(gene_var)
     gene_fano = gene_var / gene_mean
@@ -329,6 +338,23 @@ class cNMF():
                 'k_selection_plot' :  os.path.join(self.output_dir, self.name, self.name+'.k_selection.png'),
                 'k_selection_stats' :  os.path.join(self.output_dir, self.name, self.name+'.k_selection_stats.df.npz'),
             }
+
+
+    def sample(self, counts_fn, sample_method='random', sample_times=1,
+               sample_fraction=None, sample_seed=42, sample_prefix=None,
+               sample_pca_mode='auto', sample_pca_components=30,
+               sample_pca_chunk_size=2000, sample_pca_input='counts',
+               sample_numgenes=2000, sample_hvg_mode='auto',
+               sample_hvg_chunk_size=2000, sample_export_chunk_size=2000):
+        """Write independent cell samples and return their manifest path."""
+        from .sampling import sample
+
+        return sample(counts_fn, os.path.join(self.output_dir, self.name, 'sampling'),
+                      sample_method, sample_times, sample_fraction, sample_seed,
+                      sample_prefix, sample_pca_mode, sample_pca_components,
+                      sample_pca_chunk_size, sample_pca_input,
+                      sample_numgenes, sample_hvg_mode, sample_hvg_chunk_size,
+                      sample_export_chunk_size)
 
 
     def prepare(self, counts_fn, components, n_iter = 100, densify=False, tpm_fn=None, seed=None,
@@ -1258,10 +1284,23 @@ def main():
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('command', type=str, choices=['prepare', 'factorize', 'combine', 'consensus', 'k_selection_plot'])
+    parser.add_argument('command', type=str, choices=['sample', 'prepare', 'factorize', 'combine', 'consensus', 'k_selection_plot'])
     parser.add_argument('--name', type=str, help='[all] Name for analysis. All output will be placed in [output-dir]/[name]/...', nargs='?', default='cNMF')
     parser.add_argument('--output-dir', type=str, help='[all] Output directory. All output will be placed in [output-dir]/[name]/...', nargs='?', default='.')
-    parser.add_argument('-c', '--counts', type=str, help='[prepare] Input (cell x gene) counts matrix as .h5ad, .mtx, df.npz, or tab delimited text file')
+    parser.add_argument('-c', '--counts', type=str, help='[sample] Input .h5ad; [prepare] Input (cell x gene) counts as .h5ad, .mtx, df.npz, or tab delimited text')
+    parser.add_argument('--sample-method', choices=['random', 'scsampler'], default='random', help='[sample] Sampling method; scsampler reuses X_pca or computes incremental PCA')
+    parser.add_argument('--sample-times', type=int, default=1, help='[sample] Number of independent sampling draws')
+    parser.add_argument('--sample-fraction', type=float, help='[sample] Fraction of cells per draw')
+    parser.add_argument('--sample-seed', type=int, default=42, help='[sample] Master sampling seed, separate from the NMF seed')
+    parser.add_argument('--sample-prefix', type=str, help='[sample] Output filename prefix without extension (default: <input-stem>_sample)')
+    parser.add_argument('--sample-pca-mode', choices=['auto', 'recompute'], default='auto', help='[sample] Reuse existing X_pca or compute if missing; recompute ignores existing X_pca')
+    parser.add_argument('--sample-pca-components', type=int, default=30, help='[sample] Components for newly computed PCA (default 30); existing X_pca is reused as-is')
+    parser.add_argument('--sample-pca-chunk-size', type=int, default=2000, help='[sample] Cells per incremental PCA chunk (default 2000); a short final chunk is merged')
+    parser.add_argument('--sample-pca-input', choices=['counts', 'preprocessed'], default='counts', help='[sample] Newly computed PCA input: counts applies CP10K and log1p to temporary batches; preprocessed uses X unchanged')
+    parser.add_argument('--sample-numgenes', type=int, default=2000, help='[sample] Shared HVGs selected from the full input (default 2000); 0 skips HVG export; existing highly_variable is reused as-is in auto mode')
+    parser.add_argument('--sample-hvg-mode', choices=['auto', 'recompute'], default='auto', help='[sample] Reuse var[highly_variable] or compute cNMF HVGs if missing; recompute ignores an existing mask')
+    parser.add_argument('--sample-hvg-chunk-size', type=int, default=2000, help='[sample] Cells per chunk for full-input HVG statistics (default 2000)')
+    parser.add_argument('--sample-export-chunk-size', type=int, default=2000, help='[sample] Rows per sparse export chunk (default 2000); CSC uses column blocks with an equivalent element budget')
     parser.add_argument('-k', '--components', type=int, help='[prepare] Numper of components (k) for matrix factorization. Several can be specified with "-k 8 9 10"', nargs='+')
     parser.add_argument('-n', '--n-iter', type=int, help='[prepare] Number of factorization replicates', default=100)
     parser.add_argument('--total-workers', type=int, help='[all] Total number of workers to distribute jobs to', default=1)
@@ -1300,7 +1339,20 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
     
-    if args.command == 'prepare':
+    if args.command == 'sample':
+        cnmf_obj.sample(args.counts, sample_method=args.sample_method, sample_times=args.sample_times,
+                        sample_fraction=args.sample_fraction,
+                        sample_seed=args.sample_seed, sample_prefix=args.sample_prefix,
+                        sample_pca_mode=args.sample_pca_mode,
+                        sample_pca_components=args.sample_pca_components,
+                        sample_pca_chunk_size=args.sample_pca_chunk_size,
+                        sample_pca_input=args.sample_pca_input,
+                        sample_numgenes=args.sample_numgenes,
+                        sample_hvg_mode=args.sample_hvg_mode,
+                        sample_hvg_chunk_size=args.sample_hvg_chunk_size,
+                        sample_export_chunk_size=args.sample_export_chunk_size)
+
+    elif args.command == 'prepare':
         cnmf_obj.prepare(args.counts, components=args.components, n_iter=args.n_iter, densify=args.densify,
                          tpm_fn=args.tpm, seed=args.seed, beta_loss=args.beta_loss, max_NMF_iter=args.max_nmf_iter,
                          num_highvar_genes=args.numgenes, genes_file=args.genes_file, init=args.init)
