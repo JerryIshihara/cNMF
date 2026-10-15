@@ -1,5 +1,7 @@
 import numpy as np
 import pandas as pd
+import pytest
+from scipy import sparse
 
 from cnmf.qc import edist, run_qc
 
@@ -25,7 +27,9 @@ def test_edistance_matches_squared_distance_definition():
     assert actual.columns.tolist() == [1, 2]
 
 
-def test_run_qc_matches_run_qc_cnmf_reference_output(tmp_path):
+@pytest.mark.parametrize('streaming', [False, True])
+@pytest.mark.parametrize('sparse_input', [False, True])
+def test_run_qc_matches_run_qc_cnmf_reference_output(tmp_path, monkeypatch, streaming, sparse_input):
     """Match the non-LOO QC output produced by sc-blipper's run_qc_cnmf.py."""
     # Reference source: ../sc-blipper/bin/run_qc_cnmf.py. This synthetic fixture
     # reproduces the state immediately after that script's clustering and fixed-H
@@ -74,6 +78,14 @@ def test_run_qc_matches_run_qc_cnmf_reference_output(tmp_path):
     output = str(tmp_path / "reference")
     prefix = "k_3.dt_0_5"
 
+    import cnmf.qc as qc
+    import cnmf.streaming as streaming_module
+    def wrong_path(*args, **kwargs):
+        raise AssertionError('Wrong QC reconstruction path')
+    if streaming:
+        monkeypatch.setattr(qc, 'get_r2', wrong_path)
+    else:
+        monkeypatch.setattr(streaming_module, 'reconstruction_stats_streaming', wrong_path)
     run_qc(
         output=output,
         prefix=prefix,
@@ -83,8 +95,9 @@ def test_run_qc_matches_run_qc_cnmf_reference_output(tmp_path):
         l2_spectra=l2_spectra,
         local_density=local_density,
         kmeans_cluster_labels=kmeans_cluster_labels,
-        normalized_counts=normalized_counts,
+        normalized_counts=sparse.csr_matrix(normalized_counts) if sparse_input else normalized_counts,
         refit_usages=refit_usages,
+        streaming=streaming,
     )
 
     annotation_path = tmp_path / f"reference.{prefix}.annotation.tsv"
