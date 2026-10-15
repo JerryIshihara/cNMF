@@ -3,11 +3,107 @@
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import warnings
+import yaml
 
 import anndata as ad
 import h5py
 import numpy as np
+import pandas as pd
 from scipy import sparse
+
+
+def _sample_combine_runs(destination, source_runs, components=None):
+    """Stage sampled replicates under unique IDs for ordinary combine.
+
+    Rebuild links and metadata on every call. Spectra reading, missing-file
+    handling and merging belong to combine_nmf, not this helper.
+    """
+    from .cnmf import cNMF, load_df_from_npz
+
+    sources = [Path(p).resolve() for p in source_runs]
+    target = (Path(destination.output_dir) / destination.name).resolve()
+    receipt_path = target / 'cnmf_tmp' / 'pooling.json'
+    if not sources or len(set(sources)) != len(sources) or target in sources:
+        raise ValueError('Source runs must be distinct and different from destination')
+    if not receipt_path.exists() and any(p.is_file() for p in target.rglob('*')):
+        raise FileExistsError('Destination must be empty or an existing pooled run')
+
+    manifests, settings = [], None
+    for root in sources:
+        prefix = root / 'cnmf_tmp' / root.name
+        params = load_df_from_npz(str(prefix) + '.nmf_params.df.npz')
+        with open(str(prefix) + '.nmf_idvrun_params.yaml') as stream:
+            current = yaml.safe_load(stream)
+        if settings is not None and current != settings:
+            raise ValueError('Source NMF settings differ: %s' % root)
+        settings = current
+        if params.duplicated(['n_components', 'iter']).any():
+            raise ValueError('Duplicate replicate IDs: %s' % root)
+        manifests.append((root, prefix, params))
+    if type(components) is int:
+        ks = [components]
+    elif components is None:
+        ks = sorted(set(manifests[0][2].n_components))
+        if any(set(p.n_components) != set(ks) for _, _, p in manifests):
+            raise ValueError('Source K sets differ; specify components explicitly')
+    else:
+        ks = sorted(set(components))
+    if not ks:
+        raise ValueError('No components selected')
+
+    records, rows = [], []
+    with TemporaryDirectory(prefix='.combine-', dir=target.parent) as folder:
+        staged = cNMF(folder, destination.name)
+        for k in ks:
+            global_iter = 0
+            for draw, (root, prefix, params) in enumerate(manifests):
+                found = 0
+                for _, row in params[params.n_components == k].sort_values('iter').iterrows():
+                    local_iter = int(row['iter'])
+                    source = Path(str(prefix) + '.spectra.k_%d.iter_%d.df.npz' % (k, local_iter))
+                    Path(staged.paths['iter_spectra'] % (k, global_iter)).symlink_to(source)
+                    item = row.to_dict()
+                    item['iter'] = global_iter
+                    rows.append(item)
+                    records.append(dict(k=int(k), global_iter=global_iter, draw=draw,
+                                        source_run=str(root), local_iter=local_iter,
+                                        nmf_seed=int(row['nmf_seed'])))
+                    global_iter += 1
+                    found += 1
+                if not found:
+                    raise ValueError('No spectra for K=%s in %s' % (k, root))
+        staged.save_nmf_iter_params(pd.DataFrame(rows), settings)
+        stage = Path(folder) / destination.name / 'cnmf_tmp'
+        pd.DataFrame(records).to_csv(stage / 'pooled_replicates.tsv', sep='\t', index=False)
+
+        # Delete only files from the previous mapping and known downstream outputs.
+        if receipt_path.exists():
+            previous = json.loads(receipt_path.read_text())
+            for record in previous['records']:
+                link = Path(destination.paths['iter_spectra'] % (record['k'], record['global_iter']))
+                if link.is_symlink():
+                    link.unlink()
+                elif link.exists():
+                    raise FileExistsError('Refusing to remove non-link replicate: %s' % link)
+            for key, template in destination.paths.items():
+                if key in ('iter_spectra', 'iter_usages') or '%' not in template:
+                    continue
+                pattern = Path(template.replace('%d', '*').replace('%s', '*'))
+                for path in pattern.parent.glob(pattern.name):
+                    path.unlink()
+            for path in (target / 'cnmf_tmp').glob(destination.name + '.spectra.k_*.complete.json'):
+                path.unlink()
+            for path in target.glob(destination.name + '.k_*_dt_*.*'):
+                path.unlink()
+            for key in ('k_selection_plot', 'k_selection_stats'):
+                Path(destination.paths[key]).unlink(missing_ok=True)
+        for path in stage.iterdir():
+            path.replace(target / 'cnmf_tmp' / path.name)
+        receipt_path.write_text(json.dumps(dict(records=records,
+            scaling_validation='not_verified', expression_inputs='not_assigned'), indent=2))
+    warnings.warn('Spectra pooled; expression inputs are not assigned. '
+                  'Full-data consensus/refit integration must be configured separately.')
 
 
 def _sample_filenames(counts_fn, sample_times, sample_prefix=None):

@@ -486,7 +486,7 @@ class cNMF():
         self.save_nmf_iter_params(replicate_params, run_params)
         
     
-    def combine(self, components=None, skip_missing_files=False):
+    def combine(self, components=None, skip_missing_files=False, source_runs=None):
         """
         Combine NMF iterations for the same value of K
         Parameters
@@ -496,7 +496,14 @@ class cNMF():
 
         skip_missing_files : boolean
             If True, ignore iteration files that aren't found rather than crashing. Default: False
+
+        source_runs : list or None
+            Source run directories for pooling into this destination.
         """
+
+        if source_runs is not None:
+            from .sampling import _sample_combine_runs
+            _sample_combine_runs(self, source_runs, components)
 
         if type(components) is int:
             ks = [components]
@@ -789,6 +796,13 @@ class cNMF():
                     print('Missing file: %s. Skipping.' % current_file)
             else:
                 spectra = load_df_from_npz(current_file)
+                if (len(spectra) != k or not spectra.columns.is_unique or spectra.shape[1] == 0
+                        or not np.isfinite(spectra.values).all() or (spectra.values < 0).any()):
+                    raise ValueError('Invalid spectra: %s' % current_file)
+                if combined_spectra and (
+                        not spectra.columns.equals(combined_spectra[0].columns)
+                        or spectra.values.dtype != combined_spectra[0].values.dtype):
+                    raise ValueError('Gene order or dtype differs: %s' % current_file)
                 spectra.index = ['iter%d_topic%d' % (p['iter'], t+1) for t in range(k)]
                 combined_spectra.append(spectra)
                 
@@ -1287,6 +1301,7 @@ def main():
     parser.add_argument('command', type=str, choices=['sample', 'prepare', 'factorize', 'combine', 'consensus', 'k_selection_plot'])
     parser.add_argument('--name', type=str, help='[all] Name for analysis. All output will be placed in [output-dir]/[name]/...', nargs='?', default='cNMF')
     parser.add_argument('--output-dir', type=str, help='[all] Output directory. All output will be placed in [output-dir]/[name]/...', nargs='?', default='.')
+    parser.add_argument('--source-runs', type=str, help='[combine] Source run directories to pool. Output is placed in [output-dir]/[name]/...', nargs='+', default=None)
     parser.add_argument('-c', '--counts', type=str, help='[sample] Input .h5ad; [prepare] Input (cell x gene) counts as .h5ad, .mtx, df.npz, or tab delimited text')
     parser.add_argument('--sample-method', choices=['random', 'scsampler'], default='random', help='[sample] Sampling method; scsampler reuses X_pca or computes incremental PCA')
     parser.add_argument('--sample-times', type=int, default=1, help='[sample] Number of independent sampling draws')
@@ -1362,7 +1377,7 @@ def main():
                            skip_completed_runs=args.skip_completed_runs)
 
     elif args.command == 'combine':
-        cnmf_obj.combine(components=args.components)
+        cnmf_obj.combine(components=args.components, source_runs=args.source_runs)
 
     elif args.command == 'consensus':
         run_params = load_df_from_npz(cnmf_obj.paths['nmf_replicate_parameters'])
