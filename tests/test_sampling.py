@@ -77,7 +77,9 @@ def test_full_sample_and_no_overwrite(counts, tmp_path):
 
 
 @pytest.mark.parametrize('matrix_type', ['dense', 'csr', 'csc'])
-def test_computed_embedding(counts, tmp_path, matrix_type):
+def test_computed_embedding(counts, tmp_path, monkeypatch, matrix_type):
+    monkeypatch.setattr(sampling, 'SAMPLE_PCA_COMPONENTS', 3)
+    monkeypatch.setattr(sampling, 'SAMPLE_PCA_CHUNK_SIZE', 29)
     path, data = counts
     del data.obsm['X_pca']
     dense = data.X.toarray()
@@ -101,12 +103,12 @@ def test_computed_embedding(counts, tmp_path, matrix_type):
     runs = []
     for name in ('first', 'repeat'):
         manifest_path = cNMF(str(tmp_path), name).sample(
-            path, 'scsampler', 2, 0.25, 42,
-            sample_pca_components=3, sample_pca_chunk_size=29)
+            path, 'scsampler', 2, 0.25, 42)
         folder = tmp_path / name / 'sampling'
         manifest = json.loads(Path(manifest_path).read_text())
         info = manifest['pca']
         assert info['source'] == 'computed'
+        assert info['mode'] == 'auto' and info['input'] == 'counts'
         assert info['preprocessing'] == 'log1p(CP10K)'
         assert info['components'] == 3
         assert info['chunk_size'] == 29
@@ -137,26 +139,35 @@ def test_computed_embedding(counts, tmp_path, matrix_type):
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before
 
 
-def test_existing_embedding_reused_once(counts, tmp_path, monkeypatch):
+@pytest.mark.parametrize('embedding_key', ['X_pca', 'X_scVI'])
+def test_existing_embedding_reused_once(counts, tmp_path, monkeypatch, embedding_key):
     import scsampler
     import sklearn.decomposition
 
+    path, data = counts
+    expected = data.obsm['X_pca'].copy()
+    if embedding_key != 'X_pca':
+        data.obsm[embedding_key] = expected
+        data.obsm['X_pca'][:] = np.nan  # Only the requested embedding matters.
+        data.write_h5ad(path)
+
     def unexpected_fit(*args, **kwargs):
-        pytest.fail('Existing PCA should be reused without fitting')
+        pytest.fail('Existing embedding should be reused without fitting')
 
     monkeypatch.setattr(sklearn.decomposition, 'IncrementalPCA', unexpected_fit)
     actual_sampler = scsampler.scsampler
     received = []
 
     def record_embedding(embedding, **kwargs):
-        np.testing.assert_array_equal(embedding, counts[1].obsm['X_pca'])
+        np.testing.assert_array_equal(embedding, expected)
         received.append(embedding)
         return actual_sampler(embedding, **kwargs)
 
     monkeypatch.setattr(scsampler, 'scsampler', record_embedding)
-    path = sample(counts[0], tmp_path / 'out', 'scsampler', 3, 0.25)
+    path = sample(path, tmp_path / 'out', 'scsampler', 3, 0.25,
+                  sample_embedding_key=embedding_key)
     manifest = json.loads(Path(path).read_text())
-    assert manifest['pca']['source'] == 'obsm/X_pca'
+    assert manifest['pca']['source'] == f'obsm/{embedding_key}'
     assert manifest['pca']['components'] == 3  # Keep existing PCs, not default 30.
     assert manifest['pca']['dtype'] == 'float64'
     assert manifest['pca']['preprocessing'] is None
@@ -180,37 +191,106 @@ def test_skip_pca_when_unneeded(counts, tmp_path, monkeypatch, method, fraction)
     assert not (tmp_path / 'out' / 'pca.npy').exists()
 
 
-def test_pca_options_via_cli(counts, tmp_path, monkeypatch):
+@pytest.mark.parametrize('via_cli', [False, True])
+def test_custom_embedding_key(counts, tmp_path, monkeypatch, via_cli):
+    import scsampler
+
     path, data = counts
-    # Deterministic preprocessed values include negatives; do not log again.
-    data.X = np.random.default_rng(321).normal(size=data.shape)
-    data.obsm['X_pca'][:] = np.nan  # recompute must ignore the existing embedding.
+    data.obsm['X_scVI'] = np.random.default_rng(321).normal(size=(data.n_obs, 2))
+    data.obsm['X_pca'][:] = np.nan
     data.write_h5ad(path)
     before = hashlib.sha256(path.read_bytes()).hexdigest()
-    monkeypatch.setattr('sys.argv', [
-        'cnmf', 'sample', '--counts', str(path),
-        '--output-dir', str(tmp_path), '--name', 'cli',
-        '--sample-method', 'scsampler', '--sample-fraction', '0.25',
-        '--sample-pca-mode', 'recompute', '--sample-pca-components', '2',
-        '--sample-pca-chunk-size', '29', '--sample-pca-input', 'preprocessed',
-        '--sample-numgenes', '0',  # Signed PCA input is not NMF count data.
-    ])
-    main()
-    output = tmp_path / 'cli' / 'sampling'
+    received = []
+
+    def record_embedding(embedding, n_obs, **kwargs):
+        np.testing.assert_array_equal(embedding, data.obsm['X_scVI'])
+        received.append(embedding)
+        return np.arange(n_obs)
+
+    monkeypatch.setattr(scsampler, 'scsampler', record_embedding)
+    if via_cli:
+        monkeypatch.setattr('sys.argv', [
+            'cnmf', 'sample', '--counts', str(path),
+            '--output-dir', str(tmp_path), '--name', 'custom_embedding',
+            '--sample-method', 'scsampler', '--sample-fraction', '0.25',
+            '--sample-embedding-key', 'X_scVI',
+        ])
+        main()
+    else:
+        cNMF(str(tmp_path), 'custom_embedding').sample(
+            path, 'scsampler', sample_fraction=0.25, sample_embedding_key='X_scVI')
+    output = tmp_path / 'custom_embedding' / 'sampling'
     info = json.loads((output / 'manifest.json').read_text())['pca']
-    assert info['source'] == 'computed' and info['mode'] == 'recompute'
-    assert info['components'] == 2 and info['chunk_size'] == 29
-    assert info['input'] == 'preprocessed' and info['preprocessing'] == 'none'
-    reference = IncrementalPCA(n_components=2)
-    for chunk in (data.X[:29], data.X[29:58], data.X[58:]):
-        reference.partial_fit(chunk)
-    np.testing.assert_allclose(np.load(output / 'pca.npy'),
-                               reference.transform(data.X).astype(np.float32),
-                               rtol=1e-6, atol=1e-6)
+    assert len(received) == 1
+    assert info['source'] == 'obsm/X_scVI' and info['components'] == 2
+    assert info['preprocessing'] is None
+    assert not (output / 'pca.npy').exists()
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before
 
 
-def test_pca_reads_only_chunks(tmp_path):
+def test_missing_custom_embedding_does_not_fall_back(counts, tmp_path, monkeypatch):
+    import sklearn.decomposition
+
+    def unexpected_fit(*args, **kwargs):
+        pytest.fail('A missing custom embedding must not trigger PCA')
+
+    monkeypatch.setattr(sklearn.decomposition, 'IncrementalPCA', unexpected_fit)
+    with pytest.raises(ValueError, match='X_scVI'):
+        sample(counts[0], tmp_path / 'out', 'scsampler', sample_fraction=0.5,
+               sample_embedding_key='X_scVI')
+
+
+def test_random_ignores_embedding_key(counts, tmp_path):
+    manifests = []
+    for name, embedding_key in [('default', 'X_pca'), ('missing', 'X_missing')]:
+        path = sample(counts[0], tmp_path / name, sample_fraction=0.5,
+                      sample_embedding_key=embedding_key)
+        manifest = json.loads(Path(path).read_text())
+        assert manifest['pca'] is None
+        manifests.append(np.load(Path(path).parent / manifest['samples'][0]['cell_indices']))
+    np.testing.assert_array_equal(*manifests)
+
+
+@pytest.mark.parametrize('shape,components', [((60, 8), 8), ((5, 40), 4), ((40, 40), 30)])
+def test_pca_internal_defaults_clamp_to_input_size(tmp_path, shape, components):
+    data = ad.AnnData(np.random.default_rng(143).poisson(3, shape))
+    embedding, info = _sample_embedding(data, tmp_path)
+    assert sampling.SAMPLE_PCA_COMPONENTS == 30
+    assert sampling.SAMPLE_PCA_CHUNK_SIZE == 2000
+    assert embedding.shape == (shape[0], components)
+    assert info['components'] == components
+    assert info['chunk_size'] == 2000
+    assert np.isfinite(embedding).all()
+
+
+def test_sampling_help_exposes_only_embedding_option(monkeypatch, capsys):
+    monkeypatch.setattr('sys.argv', ['cnmf', '--help'])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert '--sample-embedding-key' in help_text
+    assert '--sample-pca-' not in help_text
+
+
+@pytest.mark.parametrize('option,value', [
+    ('mode', 'auto'), ('components', '3'), ('chunk-size', '29'), ('input', 'counts'),
+])
+def test_old_pca_cli_options_removed(counts, tmp_path, monkeypatch, capsys, option, value):
+    monkeypatch.setattr('sys.argv', [
+        'cnmf', 'sample', '--counts', str(counts[0]), '--output-dir', str(tmp_path),
+        '--name', 'old_pca', '--sample-fraction', '0.5',
+        f'--sample-pca-{option}', value,
+    ])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+    assert f'unrecognized arguments: --sample-pca-{option}' in capsys.readouterr().err
+
+
+def test_pca_reads_only_chunks(tmp_path, monkeypatch):
+    monkeypatch.setattr(sampling, 'SAMPLE_PCA_COMPONENTS', 3)
+    monkeypatch.setattr(sampling, 'SAMPLE_PCA_CHUNK_SIZE', 29)
     # A guarded array rejects whole-matrix conversion and records both passes.
     values = np.random.default_rng(123).poisson(3, (60, 8))
     before = values.copy()
@@ -228,8 +308,7 @@ def test_pca_reads_only_chunks(tmp_path):
             return values[rows]
 
     data = SimpleNamespace(X=ChunkOnlyMatrix(), n_obs=60, n_vars=8, obsm={})
-    embedding, info = _sample_embedding(
-        data, tmp_path, sample_pca_components=3, sample_pca_chunk_size=29)
+    embedding, info = _sample_embedding(data, tmp_path)
     assert reads == [(0, 29), (29, 60), (0, 29), (29, 60)]
     assert isinstance(embedding, np.memmap) and not embedding.flags.writeable
     assert embedding.shape == (60, 3)
@@ -245,21 +324,15 @@ def test_invalid_existing_embedding(counts, tmp_path, value):
         sample(path, tmp_path / 'out', 'scsampler', sample_fraction=0.5)
 
 
-@pytest.mark.parametrize('options,match', [
-    ({'sample_pca_mode': 'invalid'}, 'sample_pca_mode'),
-    ({'sample_pca_input': 'invalid'}, 'sample_pca_input'),
-    ({'sample_pca_components': 0}, 'sample_pca_components'),
-    ({'sample_pca_components': 9}, 'sample_pca_components'),
-    ({'sample_pca_chunk_size': 0}, 'sample_pca_chunk_size'),
-    ({'sample_pca_chunk_size': 2}, 'sample_pca_chunk_size'),
+@pytest.mark.parametrize('embedding', [
+    np.ones((60, 0)), np.ones((59, 2)), np.ones((60, 2, 1)),
+    np.full((60, 2), 'text'), np.ones((60, 2), dtype=np.complex128),
 ])
-def test_invalid_pca_options(counts, tmp_path, options, match):
-    path, data = counts
-    del data.obsm['X_pca']
-    data.write_h5ad(path)
-    kwargs = {'sample_pca_components': 3, **options}
-    with pytest.raises(ValueError, match=match):
-        sample(path, tmp_path / 'out', 'scsampler', sample_fraction=0.5, **kwargs)
+def test_invalid_embedding_shape_or_dtype(tmp_path, embedding):
+    # Namespace bypasses AnnData's own shape validation to test our contract.
+    data = SimpleNamespace(n_obs=60, obsm={'X_scVI': embedding})
+    with pytest.raises(ValueError, match='X_scVI'):
+        _sample_embedding(data, tmp_path, sample_embedding_key='X_scVI')
 
 
 @pytest.mark.parametrize('value,match', [
@@ -272,8 +345,7 @@ def test_invalid_counts_for_pca(counts, tmp_path, value, match):
     data.X[0, 0] = value
     data.write_h5ad(path)
     with pytest.raises(ValueError, match=match):
-        sample(path, tmp_path / 'out', 'scsampler', sample_fraction=0.5,
-               sample_pca_components=3)
+        sample(path, tmp_path / 'out', 'scsampler', sample_fraction=0.5)
 
 
 @pytest.mark.parametrize('via_cli', [False, True])

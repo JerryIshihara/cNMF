@@ -342,17 +342,15 @@ class cNMF():
 
     def sample(self, counts_fn, sample_method='random', sample_times=1,
                sample_fraction=None, sample_seed=42, sample_prefix=None,
-               sample_pca_mode='auto', sample_pca_components=30,
-               sample_pca_chunk_size=2000, sample_pca_input='counts',
+               sample_embedding_key='X_pca',
                sample_numgenes=2000, sample_hvg_mode='auto',
-               sample_hvg_chunk_size=2000, sample_export_chunk_size=2000):
+               sample_hvg_chunk_size=None, sample_export_chunk_size=None):
         """Write independent cell samples and return their manifest path."""
         from .sampling import sample
 
         return sample(counts_fn, os.path.join(self.output_dir, self.name, 'sampling'),
                       sample_method, sample_times, sample_fraction, sample_seed,
-                      sample_prefix, sample_pca_mode, sample_pca_components,
-                      sample_pca_chunk_size, sample_pca_input,
+                      sample_prefix, sample_embedding_key,
                       sample_numgenes, sample_hvg_mode, sample_hvg_chunk_size,
                       sample_export_chunk_size)
 
@@ -1303,19 +1301,16 @@ def main():
     parser.add_argument('--output-dir', type=str, help='[all] Output directory. All output will be placed in [output-dir]/[name]/...', nargs='?', default='.')
     parser.add_argument('--source-runs', type=str, help='[combine] Source run directories to pool. Output is placed in [output-dir]/[name]/...', nargs='+', default=None)
     parser.add_argument('-c', '--counts', type=str, help='[sample] Input .h5ad; [prepare] Input (cell x gene) counts as .h5ad, .mtx, df.npz, or tab delimited text')
-    parser.add_argument('--sample-method', choices=['random', 'scsampler'], default='random', help='[sample] Sampling method; scsampler reuses X_pca or computes incremental PCA')
+    parser.add_argument('--sample-method', choices=['random', 'scsampler'], default='random', help='[sample] Sampling method; scsampler uses an embedding, random selects cells uniformly')
     parser.add_argument('--sample-times', type=int, default=1, help='[sample] Number of independent sampling draws')
     parser.add_argument('--sample-fraction', type=float, help='[sample] Fraction of cells per draw')
     parser.add_argument('--sample-seed', type=int, default=42, help='[sample] Master sampling seed, separate from the NMF seed')
     parser.add_argument('--sample-prefix', type=str, help='[sample] Output filename prefix without extension (default: <input-stem>_sample)')
-    parser.add_argument('--sample-pca-mode', choices=['auto', 'recompute'], default='auto', help='[sample] Reuse existing X_pca or compute if missing; recompute ignores existing X_pca')
-    parser.add_argument('--sample-pca-components', type=int, default=30, help='[sample] Components for newly computed PCA (default 30); existing X_pca is reused as-is')
-    parser.add_argument('--sample-pca-chunk-size', type=int, default=2000, help='[sample] Cells per incremental PCA chunk (default 2000); a short final chunk is merged')
-    parser.add_argument('--sample-pca-input', choices=['counts', 'preprocessed'], default='counts', help='[sample] Newly computed PCA input: counts applies CP10K and log1p to temporary batches; preprocessed uses X unchanged')
+    parser.add_argument('--sample-embedding-key', default='X_pca', help='[sample] obsm embedding for scsampler (default X_pca); missing X_pca is computed from counts, other keys must exist; ignored by random sampling')
     parser.add_argument('--sample-numgenes', type=int, default=2000, help='[sample] Shared HVGs selected from the full input (default 2000); 0 skips HVG export; existing highly_variable is reused as-is in auto mode')
     parser.add_argument('--sample-hvg-mode', choices=['auto', 'recompute'], default='auto', help='[sample] Reuse var[highly_variable] or compute cNMF HVGs if missing; recompute ignores an existing mask')
-    parser.add_argument('--sample-hvg-chunk-size', type=int, default=2000, help='[sample] Cells per chunk for full-input HVG statistics (default 2000)')
-    parser.add_argument('--sample-export-chunk-size', type=int, default=2000, help='[sample] Rows per sparse export chunk (default 2000); CSC uses column blocks with an equivalent element budget')
+    parser.add_argument('--sample-hvg-chunk-size', type=int, default=None, help='[sample] Cells per HVG statistics chunk (default: automatically size from available RAM)')
+    parser.add_argument('--sample-export-chunk-size', type=int, default=None, help='[sample] Export chunk rows (default: automatically size each matrix from available RAM); explicit values use equivalent column blocks for CSC')
     parser.add_argument('-k', '--components', type=int, help='[prepare] Numper of components (k) for matrix factorization. Several can be specified with "-k 8 9 10"', nargs='+')
     parser.add_argument('-n', '--n-iter', type=int, help='[prepare] Number of factorization replicates', default=100)
     parser.add_argument('--total-workers', type=int, help='[all] Total number of workers to distribute jobs to', default=1)
@@ -1358,10 +1353,7 @@ def main():
         cnmf_obj.sample(args.counts, sample_method=args.sample_method, sample_times=args.sample_times,
                         sample_fraction=args.sample_fraction,
                         sample_seed=args.sample_seed, sample_prefix=args.sample_prefix,
-                        sample_pca_mode=args.sample_pca_mode,
-                        sample_pca_components=args.sample_pca_components,
-                        sample_pca_chunk_size=args.sample_pca_chunk_size,
-                        sample_pca_input=args.sample_pca_input,
+                        sample_embedding_key=args.sample_embedding_key,
                         sample_numgenes=args.sample_numgenes,
                         sample_hvg_mode=args.sample_hvg_mode,
                         sample_hvg_chunk_size=args.sample_hvg_chunk_size,
