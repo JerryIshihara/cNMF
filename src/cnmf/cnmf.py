@@ -812,7 +812,7 @@ class cNMF():
         return combined_spectra
     
     
-    def refit_usage(self, X, spectra):
+    def refit_usage(self, X, spectra, streaming=False):
         """
         Takes an input data matrix and a fixed spectra and uses NNLS to find the optimal
         usage matrix. Generic kwargs for NMF are loaded from self.paths['nmf_run_parameters'].
@@ -834,14 +834,19 @@ class cNMF():
         else:
             refit_nmf_kwargs.update(dict(n_components = spectra.shape[0], H = spectra, update_H = False))
             
-        _, rf_usages = self._nmf(X, nmf_kwargs=refit_nmf_kwargs)
+        if not streaming:
+            _, rf_usages = self._nmf(X, nmf_kwargs=refit_nmf_kwargs)
+        else:
+            from cnmf.streaming import _refit_from_cnmf
+            values = X.values if isinstance(X, pd.DataFrame) else X
+            rf_usages = _refit_from_cnmf(self, values, spectra)
         if (type(X) is pd.DataFrame) and (type(spectra) is pd.DataFrame):
             rf_usages = pd.DataFrame(rf_usages, index=X.index, columns=spectra.index)
           
         return(rf_usages)
     
     
-    def refit_spectra(self, X, usage):
+    def refit_spectra(self, X, usage, streaming=False):
         """
         Takes an input data matrix and a fixed usage matrix and uses NNLS to find the optimal
         spectra matrix. Generic kwargs for NMF are loaded from self.paths['nmf_run_parameters'].
@@ -856,12 +861,20 @@ class cNMF():
         usage : pandas.DataFrame or numpy.ndarray, cells X programs
             Non-negative spectra of expression programs
         """
+        if streaming:
+            from cnmf.streaming import _refit_from_cnmf
+            values = X.values if isinstance(X, pd.DataFrame) else X
+            result = _refit_from_cnmf(self, values, usage, spectra=True)
+            if isinstance(X, pd.DataFrame) and isinstance(usage, pd.DataFrame):
+                result = pd.DataFrame(result, index=usage.columns, columns=X.columns)
+            return result
         return(self.refit_usage(X.T, usage.T).T)
 
 
     def consensus(self, k, density_threshold=0.5, local_neighborhood_size=0.30, show_clustering=True,
                   build_ref=True, skip_density_and_return_after_stats=False, close_clustergram_fig=False,
-                  refit_usage=True, normalize_tpm_spectra=False, norm_counts=None):
+                  refit_usage=True, normalize_tpm_spectra=False, norm_counts=None,
+                  streaming=False):
         """
         Obtain consensus estimates of spectra and usages from a cNMF run and output a clustergram of
         the consensus matrix. Assumes prepare, factorize, and combine steps have already been run.
@@ -955,7 +968,8 @@ class cNMF():
         median_spectra = (median_spectra.T/median_spectra.sum(1)).T
 
         # Obtain reconstructed count matrix by re-fitting usage and computing dot product: usage.dot(spectra)
-        rf_usages = self.refit_usage(norm_counts.X, median_spectra)
+        refit_options = dict(streaming=True) if streaming else {}
+        rf_usages = self.refit_usage(norm_counts.X, median_spectra, **refit_options)
         rf_usages = pd.DataFrame(rf_usages, index=norm_counts.obs.index, columns=median_spectra.index)        
         
         if skip_density_and_return_after_stats:
@@ -990,7 +1004,9 @@ class cNMF():
         # with usages fixed and TPM as the input matrix
         tpm = sc.read(self.paths['tpm'])
         tpm_stats = load_df_from_npz(self.paths['tpm_stats'])
-        spectra_tpm = self.refit_spectra(tpm.X, norm_usages.astype(tpm.X.dtype))
+        # Streaming keeps fitted factors in FP64; do not round them to X's storage dtype.
+        refit_dtype = np.float64 if streaming else tpm.X.dtype
+        spectra_tpm = self.refit_spectra(tpm.X, norm_usages.astype(refit_dtype), **refit_options)
         spectra_tpm = pd.DataFrame(spectra_tpm, index=rf_usages.columns, columns=tpm.var.index)
         if normalize_tpm_spectra:
             spectra_tpm = spectra_tpm.div(spectra_tpm.sum(axis=1), axis=0) * 1e6
@@ -1012,7 +1028,8 @@ class cNMF():
             spectra_tpm_rf = spectra_tpm.loc[:,hvgs]
 
             spectra_tpm_rf = spectra_tpm_rf.div(tpm_stats.loc[hvgs, '__std'], axis=1)
-            rf_usages = self.refit_usage(norm_tpm.X, spectra_tpm_rf.astype(norm_tpm.X.dtype))
+            refit_dtype = np.float64 if streaming else norm_tpm.X.dtype
+            rf_usages = self.refit_usage(norm_tpm.X, spectra_tpm_rf.astype(refit_dtype), **refit_options)
             rf_usages = pd.DataFrame(rf_usages, index=norm_counts.obs.index, columns=spectra_tpm_rf.index)                                                                  
                
         save_df_to_npz(median_spectra, self.paths['consensus_spectra']%(k, density_threshold_repl))
@@ -1137,6 +1154,7 @@ class cNMF():
             kmeans_cluster_labels=kmeans_cluster_labels,
             normalized_counts=norm_counts.X,
             refit_usages=density_filtered_refit_usages.values,
+            streaming=streaming,
         )
                 
                 
@@ -1329,6 +1347,7 @@ def main():
     parser.add_argument('--local-neighborhood-size', type=float, help='[consensus] Fraction of the number of replicates to use as nearest neighbors for local density filtering', default=0.30)
     parser.add_argument('--show-clustering', dest='show_clustering', help='[consensus] Produce a clustergram figure summarizing the spectra clustering', action='store_true')
     parser.add_argument('--build-reference', dest='build_reference', help='[consensus] Generates a reference spectra for use in starCAT', action='store_true', default=True)
+    parser.add_argument('--streaming', action='store_true', help='[consensus, CPU CD] Stream refit calculations; input loading and QC are not yet streaming')
 
     
     parser.add_argument("--engine", type=str.lower, choices=["cpu", "gpu"], help="[factorize,consensus] NMF engine to use (default cpu)", default="cpu")
@@ -1384,7 +1403,8 @@ def main():
         for k in ks:
             merged_spectra = load_df_from_npz(cnmf_obj.paths['merged_spectra']%k)
             cnmf_obj.consensus(k, args.local_density_threshold, args.local_neighborhood_size, args.show_clustering,
-                               args.build_reference, close_clustergram_fig=True)
+                               args.build_reference, close_clustergram_fig=True,
+                               streaming=args.streaming)
 
     elif args.command == 'k_selection_plot':
         cnmf_obj.k_selection_plot(close_fig=True)
