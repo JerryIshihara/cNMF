@@ -17,12 +17,66 @@ import numpy as np
 from scipy import sparse
 from sklearn.decomposition import non_negative_factorization
 from sklearn.exceptions import ConvergenceWarning
+from sklearn.preprocessing import StandardScaler
 from threadpoolctl import threadpool_limits
 
 # Working-buffer budget, not a whole-process RAM limit. Leave 25% headroom.
 MEMORY_BUDGET = 16 * 1024**3
 DEFAULT_THREADS = 4
 DEFAULT_WORKERS = 4
+
+
+def gene_stats_streaming(expression):
+    """Population mean/variance, matching cNMF get_mean_var without loading X."""
+    scaler = StandardScaler(with_mean=False)
+    rows = _chunk_size(getattr(expression, 'source_shape', expression.shape), 0)
+    for _, _, block in _blocks(expression, rows):
+        scaler.partial_fit(block)
+    return scaler.mean_, scaler.var_
+
+
+@threadpool_limits.wrap(limits=DEFAULT_THREADS, user_api='blas')
+def ols_streaming(usages, expression):
+    """cNMF's normalized OLS, with streamed gene statistics and cross-products."""
+    mean, variance = gene_stats_streaming(expression)
+    std = np.sqrt(np.maximum(variance, 1e-12))
+    k = usages.shape[1]
+    rows = _chunk_size(expression.shape, k, usages.nbytes + 8*k*expression.shape[1])
+    xtx = np.zeros((k, k), dtype=np.float64)
+    xty = np.zeros((k, expression.shape[1]), dtype=np.float64)
+    for start, stop, block in _blocks(expression, rows):
+        if sparse.issparse(block):
+            block = block.toarray()
+        block = (block - mean) / std
+        w = np.asarray(usages[start:stop], dtype=np.float64)
+        xtx += w.T @ w
+        xty += w.T @ block
+    return np.linalg.lstsq(xtx, xty, rcond=None)[0]
+
+
+class ScaledExpression:
+    """Lazy HVG selection and sample-standard-deviation scaling for final refit."""
+    def __init__(self, expression, columns):
+        if getattr(expression, 'format', None) == 'csc' and not sparse.issparse(expression):
+            raise ValueError('Streaming currently requires CSR or dense X, not CSC')
+        self.expression = expression
+        self.columns = np.asarray(columns)
+        self.shape = (expression.shape[0], len(columns))
+        self.source_shape = expression.shape
+        self.dtype = np.dtype('float64')
+        self.scale = np.ones(len(columns))
+        # Account for full-width sparse row reads when budgeting chunks.
+        _, variance = gene_stats_streaming(self)
+        self.scale = np.sqrt(variance * self.shape[0] / (self.shape[0] - 1))
+        # Scanpy's sparse scale leaves constant genes unchanged.
+        if sparse.issparse(expression) or getattr(expression, 'format', None) in ('csr', 'csc'):
+            self.scale[self.scale == 0] = 1
+
+    def __getitem__(self, rows):
+        block = self.expression[rows][:, self.columns].astype(np.float64, copy=False)
+        if sparse.issparse(block):
+            return block.multiply(1 / self.scale).tocsr()
+        return block / self.scale
 
 
 def _chunk_size(shape, k, fixed_bytes=0):
@@ -62,11 +116,16 @@ def _checked(value):
     return value
 
 
-def _blocks(x, chunk_size):
-    """Promote only the selected expression block, before products or reductions."""
+def _blocks(x, chunk_size, dtype=np.float64):
+    """Read checked row chunks; dtype=None preserves storage precision for export."""
+    if getattr(x, 'format', None) == 'csc' and not sparse.issparse(x):
+        raise ValueError('Streaming currently requires CSR or dense X, not CSC')
     for start in range(0, x.shape[0], chunk_size):
         stop = min(start + chunk_size, x.shape[0])
-        yield start, stop, _checked(x[start:stop].astype(np.float64, copy=False))
+        block = x[start:stop]
+        if dtype is not None:
+            block = block.astype(dtype, copy=False)
+        yield start, stop, _checked(block)
 
 
 def _validate(chunk_size, max_iter, tol, alpha, l1_ratio):
@@ -132,7 +191,7 @@ def refit_usage_streaming(expression_path, spectra, output_path, chunk_size=None
         if len(x.shape) != 2 or min(x.shape) < 1 or h.ndim != 2 or h.shape[0] < 1 or h.shape[1] != x.shape[1]:
             raise ValueError('Expression and spectra shapes do not match')
         if chunk_size is None:
-            chunk_size = _chunk_size(x.shape, h.shape[0],
+            chunk_size = _chunk_size(getattr(x, 'source_shape', x.shape), h.shape[0],
                                      DEFAULT_WORKERS * (4*h.nbytes + 8*h.shape[0]**2))
         _validate(chunk_size, max_iter, tol, alpha, l1_ratio)
         output_path.parent.mkdir(parents=True, exist_ok=True)

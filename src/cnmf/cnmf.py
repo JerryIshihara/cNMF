@@ -10,6 +10,7 @@ import yaml
 import subprocess
 import scipy.sparse as sp
 import warnings
+from contextlib import ExitStack
 
 from scipy.spatial.distance import squareform
 from sklearn.decomposition import non_negative_factorization
@@ -357,7 +358,8 @@ class cNMF():
 
     def prepare(self, counts_fn, components, n_iter = 100, densify=False, tpm_fn=None, seed=None,
                         beta_loss='frobenius',num_highvar_genes=2000, genes_file=None,
-                        alpha_usage=0.0, alpha_spectra=0.0, init='random', max_NMF_iter=1000):
+                        alpha_usage=0.0, alpha_spectra=0.0, init='random', max_NMF_iter=1000,
+                        streaming=False):
         """
         Load input counts, reduce to high-variance genes, and variance normalize genes.
         Prepare file for distributing jobs over workers.
@@ -402,82 +404,90 @@ class cNMF():
 
         max_NMF_iter : int, optional (default=1000)
             Maximum number of iterations per individual NMF run
+
+        streaming : boolean, optional (default=False)
+            Prepare dense/CSR H5AD expression in row chunks. Requires genes_file;
+            reuses existing HVGs and writes the usual prepare artifacts.
         """
 
 
-        if counts_fn.endswith('.h5ad'):
-            input_counts = sc.read(counts_fn)
-        elif counts_fn.endswith('.mtx') or counts_fn.endswith('.mtx.gz'):
-            counts_dir = os.path.dirname(counts_fn)
-            input_counts = sc.read_10x_mtx(path = counts_dir)            
+        if streaming:
+            from cnmf.prepare_streaming import prepare_inputs_streaming
+            prepare_inputs_streaming(counts_fn, self.paths, genes_file, tpm_fn, densify)
         else:
-            ## Load txt or compressed dataframe and convert to scanpy object
-            if counts_fn.endswith('.npz'):
-                input_counts = load_df_from_npz(counts_fn)        
+            if counts_fn.endswith('.h5ad'):
+                input_counts = sc.read(counts_fn)
+            elif counts_fn.endswith('.mtx') or counts_fn.endswith('.mtx.gz'):
+                counts_dir = os.path.dirname(counts_fn)
+                input_counts = sc.read_10x_mtx(path = counts_dir)
             else:
-                input_counts = pd.read_csv(counts_fn, sep='\t', index_col=0)
-                
-            if densify:
-                input_counts = sc.AnnData(X=input_counts.values,
-                                       obs=pd.DataFrame(index=input_counts.index),
-                                       var=pd.DataFrame(index=input_counts.columns))
+                ## Load txt or compressed dataframe and convert to scanpy object
+                if counts_fn.endswith('.npz'):
+                    input_counts = load_df_from_npz(counts_fn)
+                else:
+                    input_counts = pd.read_csv(counts_fn, sep='\t', index_col=0)
+
+                if densify:
+                    input_counts = sc.AnnData(X=input_counts.values,
+                                           obs=pd.DataFrame(index=input_counts.index),
+                                           var=pd.DataFrame(index=input_counts.columns))
+                else:
+                    input_counts = sc.AnnData(X=sp.csr_matrix(input_counts.values),
+                                           obs=pd.DataFrame(index=input_counts.index),
+                                           var=pd.DataFrame(index=input_counts.columns))
+
+
+            if sp.issparse(input_counts.X) & densify:
+                input_counts.X = np.array(input_counts.X.todense())
+
+            if tpm_fn is None:
+                tpm = compute_tpm(input_counts)
+                sc.write(self.paths['tpm'], tpm)
+            elif tpm_fn.endswith('.mtx') or tpm_fn.endswith('.mtx.gz'):
+                tpm_dir = os.path.dirname(tpm_fn)
+                tpm = sc.read_10x_mtx(path = tpm_dir)
+                sc.write(self.paths['tpm'], tpm)
+            elif tpm_fn.endswith('.h5ad'):
+                subprocess.call('cp %s %s' % (tpm_fn, self.paths['tpm']), shell=True)
+                tpm = sc.read(self.paths['tpm'])
             else:
-                input_counts = sc.AnnData(X=sp.csr_matrix(input_counts.values),
-                                       obs=pd.DataFrame(index=input_counts.index),
-                                       var=pd.DataFrame(index=input_counts.columns))
+                if tpm_fn.endswith('.npz'):
+                    tpm = load_df_from_npz(tpm_fn)
+                else:
+                    tpm = pd.read_csv(tpm_fn, sep='\t', index_col=0)
 
-                
-        if sp.issparse(input_counts.X) & densify:
-            input_counts.X = np.array(input_counts.X.todense())
- 
-        if tpm_fn is None:
-            tpm = compute_tpm(input_counts)
-            sc.write(self.paths['tpm'], tpm)
-        elif tpm_fn.endswith('.mtx') or tpm_fn.endswith('.mtx.gz'):
-            tpm_dir = os.path.dirname(tpm_fn)
-            tpm = sc.read_10x_mtx(path = tpm_dir)      
-            sc.write(self.paths['tpm'], tpm)        
-        elif tpm_fn.endswith('.h5ad'):
-            subprocess.call('cp %s %s' % (tpm_fn, self.paths['tpm']), shell=True)
-            tpm = sc.read(self.paths['tpm'])
-        else:
-            if tpm_fn.endswith('.npz'):
-                tpm = load_df_from_npz(tpm_fn)
+                if densify:
+                    tpm = sc.AnnData(X=tpm.values,
+                                obs=pd.DataFrame(index=tpm.index),
+                                var=pd.DataFrame(index=tpm.columns))
+                else:
+                    tpm = sc.AnnData(X=sp.csr_matrix(tpm.values),
+                                obs=pd.DataFrame(index=tpm.index),
+                                var=pd.DataFrame(index=tpm.columns))
+
+                sc.write(self.paths['tpm'], tpm)
+
+            if sp.issparse(tpm.X):
+                gene_tpm_mean, gene_tpm_stddev = get_mean_var(tpm.X)
+                gene_tpm_stddev = gene_tpm_stddev**.5
             else:
-                tpm = pd.read_csv(tpm_fn, sep='\t', index_col=0)
-            
-            if densify:
-                tpm = sc.AnnData(X=tpm.values,
-                            obs=pd.DataFrame(index=tpm.index),
-                            var=pd.DataFrame(index=tpm.columns)) 
+                gene_tpm_mean = np.array(tpm.X.mean(axis=0)).reshape(-1)
+                gene_tpm_stddev = np.array(tpm.X.std(axis=0, ddof=0)).reshape(-1)
+
+
+            input_tpm_stats = pd.DataFrame([gene_tpm_mean, gene_tpm_stddev],
+                 index = ['__mean', '__std'], columns = tpm.var.index).T
+            save_df_to_npz(input_tpm_stats, self.paths['tpm_stats'])
+
+            if genes_file is not None:
+                highvargenes = open(genes_file).read().rstrip().split('\n')
             else:
-                tpm = sc.AnnData(X=sp.csr_matrix(tpm.values),
-                            obs=pd.DataFrame(index=tpm.index),
-                            var=pd.DataFrame(index=tpm.columns)) 
+                highvargenes = None
 
-            sc.write(self.paths['tpm'], tpm)
-        
-        if sp.issparse(tpm.X):
-            gene_tpm_mean, gene_tpm_stddev = get_mean_var(tpm.X)
-            gene_tpm_stddev = gene_tpm_stddev**.5
-        else:
-            gene_tpm_mean = np.array(tpm.X.mean(axis=0)).reshape(-1)
-            gene_tpm_stddev = np.array(tpm.X.std(axis=0, ddof=0)).reshape(-1)
-            
-            
-        input_tpm_stats = pd.DataFrame([gene_tpm_mean, gene_tpm_stddev],
-             index = ['__mean', '__std'], columns = tpm.var.index).T
-        save_df_to_npz(input_tpm_stats, self.paths['tpm_stats'])
-        
-        if genes_file is not None:
-            highvargenes = open(genes_file).read().rstrip().split('\n')
-        else:
-            highvargenes = None
+            norm_counts = self.get_norm_counts(input_counts, tpm, num_highvar_genes=num_highvar_genes,
+                                                   high_variance_genes_filter=highvargenes)
 
-        norm_counts = self.get_norm_counts(input_counts, tpm, num_highvar_genes=num_highvar_genes,
-                                               high_variance_genes_filter=highvargenes)
-
-        self.save_norm_counts(norm_counts)
+            self.save_norm_counts(norm_counts)
         (replicate_params, run_params) = self.get_nmf_iter_params(ks=components, n_iter=n_iter, random_state_seed=seed,
                                                                   beta_loss=beta_loss, alpha_usage=alpha_usage,
                                                                   alpha_spectra=alpha_spectra, init=init, max_iter=max_NMF_iter)
@@ -920,244 +930,266 @@ class cNMF():
         """
         
         
-        merged_spectra = load_df_from_npz(self.paths['merged_spectra']%k)
-        if norm_counts is None:
-            norm_counts = sc.read(self.paths['normalized_counts'])
+        with ExitStack() as stack:
+            merged_spectra = load_df_from_npz(self.paths['merged_spectra']%k)
+            if norm_counts is None:
+                norm_counts = sc.read(self.paths['normalized_counts'], backed='r' if streaming else None)
+                if streaming:
+                    stack.callback(norm_counts.file.close)
 
-        density_threshold_str = str(density_threshold)
-        if skip_density_and_return_after_stats:
-            density_threshold_str = '2'
-        density_threshold_repl = density_threshold_str.replace('.', '_')
-        n_neighbors = int(local_neighborhood_size * merged_spectra.shape[0]/k)
+            density_threshold_str = str(density_threshold)
+            if skip_density_and_return_after_stats:
+                density_threshold_str = '2'
+            density_threshold_repl = density_threshold_str.replace('.', '_')
+            n_neighbors = int(local_neighborhood_size * merged_spectra.shape[0]/k)
 
-        # Rescale topics such to length of 1.
-        l2_spectra = (merged_spectra.T/np.sqrt((merged_spectra**2).sum(axis=1))).T
+            # Rescale topics such to length of 1.
+            l2_spectra = (merged_spectra.T/np.sqrt((merged_spectra**2).sum(axis=1))).T
 
-        if not skip_density_and_return_after_stats:
-            # Compute the local density matrix (if not previously cached)
-            topics_dist = None
-            if os.path.isfile(self.paths['local_density_cache'] % k):
-                local_density = load_df_from_npz(self.paths['local_density_cache'] % k)
-            else:
-                #   first find the full distance matrix
-                topics_dist = euclidean_distances(l2_spectra.values)
-                #   partition based on the first n neighbors
-                partitioning_order  = np.argpartition(topics_dist, n_neighbors+1)[:, :n_neighbors+1]
-                #   find the mean over those n_neighbors (excluding self, which has a distance of 0)
-                distance_to_nearest_neighbors = topics_dist[np.arange(topics_dist.shape[0])[:, None], partitioning_order]
-                local_density = pd.DataFrame(distance_to_nearest_neighbors.sum(1)/(n_neighbors),
-                                             columns=['local_density'],
-                                             index=l2_spectra.index)
-                save_df_to_npz(local_density, self.paths['local_density_cache'] % k)
-                del(partitioning_order)
-                del(distance_to_nearest_neighbors)
-
-            density_filter = local_density.iloc[:, 0] < density_threshold
-            l2_spectra = l2_spectra.loc[density_filter, :]
-            if l2_spectra.shape[0] == 0:
-                raise RuntimeError("Zero components remain after density filtering. Consider increasing density threshold")
-
-        kmeans_model = KMeans(n_clusters=k, n_init=10, random_state=1)
-        kmeans_model.fit(l2_spectra)
-        kmeans_cluster_labels = pd.Series(kmeans_model.labels_+1, index=l2_spectra.index)
-
-        # Find median usage for each gene across cluster
-        median_spectra = l2_spectra.groupby(kmeans_cluster_labels).median()
-
-        # Normalize median spectra to probability distributions.
-        median_spectra = (median_spectra.T/median_spectra.sum(1)).T
-
-        # Obtain reconstructed count matrix by re-fitting usage and computing dot product: usage.dot(spectra)
-        refit_options = dict(streaming=True) if streaming else {}
-        rf_usages = self.refit_usage(norm_counts.X, median_spectra, **refit_options)
-        rf_usages = pd.DataFrame(rf_usages, index=norm_counts.obs.index, columns=median_spectra.index)        
-        
-        if skip_density_and_return_after_stats:
-            silhouette = silhouette_score(l2_spectra.values, kmeans_cluster_labels, metric='euclidean')
-            
-            # Compute prediction error as a frobenius norm
-            rf_pred_norm_counts = rf_usages.dot(median_spectra)        
-            if sp.issparse(norm_counts.X):
-                prediction_error = ((norm_counts.X.todense() - rf_pred_norm_counts)**2).sum().sum()
-            else:
-                prediction_error = ((norm_counts.X - rf_pred_norm_counts)**2).sum().sum()    
-                
-            consensus_stats = pd.DataFrame([k, density_threshold, silhouette,  prediction_error],
-                    index = ['k', 'local_density_threshold', 'silhouette', 'prediction_error'],
-                    columns = ['stats'])
-
-            return(consensus_stats)           
-
-        density_filtered_refit_usages = rf_usages
-        
-        # Re-order usage by total contribution
-        norm_usages = rf_usages.div(rf_usages.sum(axis=1), axis=0)      
-        reorder = norm_usages.sum(axis=0).sort_values(ascending=False)
-        rf_usages = rf_usages.loc[:, reorder.index]
-        norm_usages = norm_usages.loc[:, reorder.index]
-        median_spectra = median_spectra.loc[reorder.index, :]
-        rf_usages.columns = np.arange(1, rf_usages.shape[1]+1)
-        norm_usages.columns = rf_usages.columns
-        median_spectra.index = rf_usages.columns
-        
-        # Convert spectra to TPM units, and obtain results for all genes by running last step of NMF
-        # with usages fixed and TPM as the input matrix
-        tpm = sc.read(self.paths['tpm'])
-        tpm_stats = load_df_from_npz(self.paths['tpm_stats'])
-        # Streaming keeps fitted factors in FP64; do not round them to X's storage dtype.
-        refit_dtype = np.float64 if streaming else tpm.X.dtype
-        spectra_tpm = self.refit_spectra(tpm.X, norm_usages.astype(refit_dtype), **refit_options)
-        spectra_tpm = pd.DataFrame(spectra_tpm, index=rf_usages.columns, columns=tpm.var.index)
-        if normalize_tpm_spectra:
-            spectra_tpm = spectra_tpm.div(spectra_tpm.sum(axis=1), axis=0) * 1e6
-                    
-        # Convert spectra to Z-score units by fitting OLS regression of the Z-scored TPM against GEP usage
-        usage_coef = efficient_ols_all_cols(rf_usages.values, tpm.X, normalize_y=True)
-        usage_coef = pd.DataFrame(usage_coef, index=rf_usages.columns, columns=tpm.var.index)
-        
-        if refit_usage:
-            ## Re-fitting usage a final time on std-scaled HVG TPM seems to
-            ## increase accuracy on simulated data
-            hvgs = open(self.paths['nmf_genes_list']).read().split('\n')
-            norm_tpm = tpm[:, hvgs]
-            if sp.issparse(norm_tpm.X):
-                sc.pp.scale(norm_tpm, zero_center=False)                       
-            else:
-                norm_tpm.X /= norm_tpm.X.std(axis=0, ddof=1)
-                
-            spectra_tpm_rf = spectra_tpm.loc[:,hvgs]
-
-            spectra_tpm_rf = spectra_tpm_rf.div(tpm_stats.loc[hvgs, '__std'], axis=1)
-            refit_dtype = np.float64 if streaming else norm_tpm.X.dtype
-            rf_usages = self.refit_usage(norm_tpm.X, spectra_tpm_rf.astype(refit_dtype), **refit_options)
-            rf_usages = pd.DataFrame(rf_usages, index=norm_counts.obs.index, columns=spectra_tpm_rf.index)                                                                  
-               
-        save_df_to_npz(median_spectra, self.paths['consensus_spectra']%(k, density_threshold_repl))
-        save_df_to_npz(rf_usages, self.paths['consensus_usages']%(k, density_threshold_repl))
-        #save_df_to_npz(consensus_stats, self.paths['consensus_stats']%(k, density_threshold_repl))
-        save_df_to_text(median_spectra, self.paths['consensus_spectra__txt']%(k, density_threshold_repl))
-        save_df_to_text(rf_usages, self.paths['consensus_usages__txt']%(k, density_threshold_repl))
-        save_df_to_npz(spectra_tpm, self.paths['gene_spectra_tpm']%(k, density_threshold_repl))
-        save_df_to_text(spectra_tpm, self.paths['gene_spectra_tpm__txt']%(k, density_threshold_repl))
-        save_df_to_npz(usage_coef, self.paths['gene_spectra_score']%(k, density_threshold_repl))
-        save_df_to_text(usage_coef, self.paths['gene_spectra_score__txt']%(k, density_threshold_repl))
-        if show_clustering:
-            if topics_dist is None:
-                topics_dist = euclidean_distances(l2_spectra.values)
-                # (l2_spectra was already filtered using the density filter)
-            else:
-                # (but the previously computed topics_dist was not!)
-                topics_dist = topics_dist[density_filter.values, :][:, density_filter.values]
-
-
-            spectra_order = []
-            for cl in sorted(set(kmeans_cluster_labels)):
-
-                cl_filter = kmeans_cluster_labels==cl
-
-                if cl_filter.sum() > 1:
-                    cl_dist = squareform(topics_dist[cl_filter, :][:, cl_filter], checks=False)
-                    cl_dist[cl_dist < 0] = 0 #Rarely get floating point arithmetic issues
-                    cl_link = linkage(cl_dist, 'average')
-                    cl_leaves_order = leaves_list(cl_link)
-
-                    spectra_order += list(np.where(cl_filter)[0][cl_leaves_order])
+            if not skip_density_and_return_after_stats:
+                # Compute the local density matrix (if not previously cached)
+                topics_dist = None
+                if os.path.isfile(self.paths['local_density_cache'] % k):
+                    local_density = load_df_from_npz(self.paths['local_density_cache'] % k)
                 else:
-                    ## Corner case where a component only has one element
-                    spectra_order += list(np.where(cl_filter)[0])
+                    #   first find the full distance matrix
+                    topics_dist = euclidean_distances(l2_spectra.values)
+                    #   partition based on the first n neighbors
+                    partitioning_order  = np.argpartition(topics_dist, n_neighbors+1)[:, :n_neighbors+1]
+                    #   find the mean over those n_neighbors (excluding self, which has a distance of 0)
+                    distance_to_nearest_neighbors = topics_dist[np.arange(topics_dist.shape[0])[:, None], partitioning_order]
+                    local_density = pd.DataFrame(distance_to_nearest_neighbors.sum(1)/(n_neighbors),
+                                                 columns=['local_density'],
+                                                 index=l2_spectra.index)
+                    save_df_to_npz(local_density, self.paths['local_density_cache'] % k)
+                    del(partitioning_order)
+                    del(distance_to_nearest_neighbors)
+
+                density_filter = local_density.iloc[:, 0] < density_threshold
+                l2_spectra = l2_spectra.loc[density_filter, :]
+                if l2_spectra.shape[0] == 0:
+                    raise RuntimeError("Zero components remain after density filtering. Consider increasing density threshold")
+
+            kmeans_model = KMeans(n_clusters=k, n_init=10, random_state=1)
+            kmeans_model.fit(l2_spectra)
+            kmeans_cluster_labels = pd.Series(kmeans_model.labels_+1, index=l2_spectra.index)
+
+            # Find median usage for each gene across cluster
+            median_spectra = l2_spectra.groupby(kmeans_cluster_labels).median()
+
+            # Normalize median spectra to probability distributions.
+            median_spectra = (median_spectra.T/median_spectra.sum(1)).T
+
+            # Obtain reconstructed count matrix by re-fitting usage and computing dot product: usage.dot(spectra)
+            refit_options = dict(streaming=True) if streaming else {}
+            rf_usages = self.refit_usage(norm_counts.X, median_spectra, **refit_options)
+            rf_usages = pd.DataFrame(rf_usages, index=norm_counts.obs.index, columns=median_spectra.index)
+
+            if skip_density_and_return_after_stats:
+                silhouette = silhouette_score(l2_spectra.values, kmeans_cluster_labels, metric='euclidean')
+
+                # Compute prediction error as a frobenius norm
+                if streaming:
+                    from cnmf.streaming import reconstruction_stats_streaming
+                    _, prediction_error, _ = reconstruction_stats_streaming(
+                        norm_counts.X, rf_usages.values, median_spectra.values)
+                elif sp.issparse(norm_counts.X):
+                    rf_pred_norm_counts = rf_usages.dot(median_spectra)
+                    prediction_error = ((norm_counts.X.todense() - rf_pred_norm_counts)**2).sum().sum()
+                else:
+                    rf_pred_norm_counts = rf_usages.dot(median_spectra)
+                    prediction_error = ((norm_counts.X - rf_pred_norm_counts)**2).sum().sum()
+
+                consensus_stats = pd.DataFrame([k, density_threshold, silhouette,  prediction_error],
+                        index = ['k', 'local_density_threshold', 'silhouette', 'prediction_error'],
+                        columns = ['stats'])
+
+                return(consensus_stats)
+
+            density_filtered_refit_usages = rf_usages
+
+            # Re-order usage by total contribution
+            norm_usages = rf_usages.div(rf_usages.sum(axis=1), axis=0)
+            reorder = norm_usages.sum(axis=0).sort_values(ascending=False)
+            rf_usages = rf_usages.loc[:, reorder.index]
+            norm_usages = norm_usages.loc[:, reorder.index]
+            median_spectra = median_spectra.loc[reorder.index, :]
+            rf_usages.columns = np.arange(1, rf_usages.shape[1]+1)
+            norm_usages.columns = rf_usages.columns
+            median_spectra.index = rf_usages.columns
+
+            # Convert spectra to TPM units, and obtain results for all genes by running last step of NMF
+            # with usages fixed and TPM as the input matrix
+            tpm = sc.read(self.paths['tpm'], backed='r' if streaming else None)
+            if streaming:
+                stack.callback(tpm.file.close)
+            tpm_stats = load_df_from_npz(self.paths['tpm_stats'])
+            # Streaming keeps fitted factors in FP64; do not round them to X's storage dtype.
+            refit_dtype = np.float64 if streaming else tpm.X.dtype
+            spectra_tpm = self.refit_spectra(tpm.X, norm_usages.astype(refit_dtype), **refit_options)
+            spectra_tpm = pd.DataFrame(spectra_tpm, index=rf_usages.columns, columns=tpm.var.index)
+            if normalize_tpm_spectra:
+                spectra_tpm = spectra_tpm.div(spectra_tpm.sum(axis=1), axis=0) * 1e6
+
+            # Convert spectra to Z-score units by fitting OLS regression of the Z-scored TPM against GEP usage
+            if streaming:
+                from cnmf.streaming import ols_streaming
+                usage_coef = ols_streaming(rf_usages.values, tpm.X)
+            else:
+                usage_coef = efficient_ols_all_cols(rf_usages.values, tpm.X, normalize_y=True)
+            usage_coef = pd.DataFrame(usage_coef, index=rf_usages.columns, columns=tpm.var.index)
+
+            if refit_usage:
+                ## Re-fitting usage a final time on std-scaled HVG TPM seems to
+                ## increase accuracy on simulated data
+                hvgs = open(self.paths['nmf_genes_list']).read().split('\n')
+                if streaming:
+                    from cnmf.streaming import ScaledExpression
+                    columns = tpm.var_names.get_indexer(hvgs)
+                    if (columns < 0).any():
+                        raise ValueError('TPM is missing HVG genes')
+                    refit_expression = ScaledExpression(tpm.X, columns)
+                else:
+                    norm_tpm = tpm[:, hvgs]
+                    if sp.issparse(norm_tpm.X):
+                        sc.pp.scale(norm_tpm, zero_center=False)
+                    else:
+                        norm_tpm.X /= norm_tpm.X.std(axis=0, ddof=1)
+                    refit_expression = norm_tpm.X
+
+                spectra_tpm_rf = spectra_tpm.loc[:,hvgs]
+
+                spectra_tpm_rf = spectra_tpm_rf.div(tpm_stats.loc[hvgs, '__std'], axis=1)
+                refit_dtype = np.float64 if streaming else refit_expression.dtype
+                rf_usages = self.refit_usage(refit_expression, spectra_tpm_rf.astype(refit_dtype), **refit_options)
+                rf_usages = pd.DataFrame(rf_usages, index=norm_counts.obs.index, columns=spectra_tpm_rf.index)
+
+            save_df_to_npz(median_spectra, self.paths['consensus_spectra']%(k, density_threshold_repl))
+            save_df_to_npz(rf_usages, self.paths['consensus_usages']%(k, density_threshold_repl))
+            #save_df_to_npz(consensus_stats, self.paths['consensus_stats']%(k, density_threshold_repl))
+            save_df_to_text(median_spectra, self.paths['consensus_spectra__txt']%(k, density_threshold_repl))
+            save_df_to_text(rf_usages, self.paths['consensus_usages__txt']%(k, density_threshold_repl))
+            save_df_to_npz(spectra_tpm, self.paths['gene_spectra_tpm']%(k, density_threshold_repl))
+            save_df_to_text(spectra_tpm, self.paths['gene_spectra_tpm__txt']%(k, density_threshold_repl))
+            save_df_to_npz(usage_coef, self.paths['gene_spectra_score']%(k, density_threshold_repl))
+            save_df_to_text(usage_coef, self.paths['gene_spectra_score__txt']%(k, density_threshold_repl))
+            if show_clustering:
+                if topics_dist is None:
+                    topics_dist = euclidean_distances(l2_spectra.values)
+                    # (l2_spectra was already filtered using the density filter)
+                else:
+                    # (but the previously computed topics_dist was not!)
+                    topics_dist = topics_dist[density_filter.values, :][:, density_filter.values]
 
 
-            from matplotlib import gridspec
-            import matplotlib.pyplot as plt
+                spectra_order = []
+                for cl in sorted(set(kmeans_cluster_labels)):
 
-            width_ratios = [0.5, 9, 0.5, 4, 1]
-            height_ratios = [0.5, 9]
-            fig = plt.figure(figsize=(sum(width_ratios), sum(height_ratios)))
-            gs = gridspec.GridSpec(len(height_ratios), len(width_ratios), fig,
-                                    0.01, 0.01, 0.98, 0.98,
-                                   height_ratios=height_ratios,
-                                   width_ratios=width_ratios,
-                                   wspace=0, hspace=0)
+                    cl_filter = kmeans_cluster_labels==cl
 
-            dist_ax = fig.add_subplot(gs[1,1], xscale='linear', yscale='linear',
-                                      xticks=[], yticks=[],xlabel='', ylabel='',
-                                      frameon=True)
+                    if cl_filter.sum() > 1:
+                        cl_dist = squareform(topics_dist[cl_filter, :][:, cl_filter], checks=False)
+                        cl_dist[cl_dist < 0] = 0 #Rarely get floating point arithmetic issues
+                        cl_link = linkage(cl_dist, 'average')
+                        cl_leaves_order = leaves_list(cl_link)
 
-            D = topics_dist[spectra_order, :][:, spectra_order]
-            dist_im = dist_ax.imshow(D, interpolation='none', cmap='viridis',
-                                     aspect='auto', rasterized=True)
-
-            left_ax = fig.add_subplot(gs[1,0], xscale='linear', yscale='linear', xticks=[], yticks=[],
-                xlabel='', ylabel='', frameon=True)
-            left_ax.imshow(kmeans_cluster_labels.values[spectra_order].reshape(-1, 1),
-                            interpolation='none', cmap='Spectral', aspect='auto',
-                            rasterized=True)
+                        spectra_order += list(np.where(cl_filter)[0][cl_leaves_order])
+                    else:
+                        ## Corner case where a component only has one element
+                        spectra_order += list(np.where(cl_filter)[0])
 
 
-            top_ax = fig.add_subplot(gs[0,1], xscale='linear', yscale='linear', xticks=[], yticks=[],
-                xlabel='', ylabel='', frameon=True)
-            top_ax.imshow(kmeans_cluster_labels.values[spectra_order].reshape(1, -1),
-                              interpolation='none', cmap='Spectral', aspect='auto',
+                from matplotlib import gridspec
+                import matplotlib.pyplot as plt
+
+                width_ratios = [0.5, 9, 0.5, 4, 1]
+                height_ratios = [0.5, 9]
+                fig = plt.figure(figsize=(sum(width_ratios), sum(height_ratios)))
+                gs = gridspec.GridSpec(len(height_ratios), len(width_ratios), fig,
+                                        0.01, 0.01, 0.98, 0.98,
+                                       height_ratios=height_ratios,
+                                       width_ratios=width_ratios,
+                                       wspace=0, hspace=0)
+
+                dist_ax = fig.add_subplot(gs[1,1], xscale='linear', yscale='linear',
+                                          xticks=[], yticks=[],xlabel='', ylabel='',
+                                          frameon=True)
+
+                D = topics_dist[spectra_order, :][:, spectra_order]
+                dist_im = dist_ax.imshow(D, interpolation='none', cmap='viridis',
+                                         aspect='auto', rasterized=True)
+
+                left_ax = fig.add_subplot(gs[1,0], xscale='linear', yscale='linear', xticks=[], yticks=[],
+                    xlabel='', ylabel='', frameon=True)
+                left_ax.imshow(kmeans_cluster_labels.values[spectra_order].reshape(-1, 1),
+                                interpolation='none', cmap='Spectral', aspect='auto',
                                 rasterized=True)
 
 
-            hist_gs = gridspec.GridSpecFromSubplotSpec(3, 1, subplot_spec=gs[1, 3],
-                                   wspace=0, hspace=0)
+                top_ax = fig.add_subplot(gs[0,1], xscale='linear', yscale='linear', xticks=[], yticks=[],
+                    xlabel='', ylabel='', frameon=True)
+                top_ax.imshow(kmeans_cluster_labels.values[spectra_order].reshape(1, -1),
+                                  interpolation='none', cmap='Spectral', aspect='auto',
+                                    rasterized=True)
 
-            hist_ax = fig.add_subplot(hist_gs[0,0], xscale='linear', yscale='linear',
-                xlabel='', ylabel='', frameon=True, title='Local density histogram')
-            hist_ax.hist(local_density.values, bins=np.linspace(0, 1, 50))
-            hist_ax.yaxis.tick_right()
 
-            xlim = hist_ax.get_xlim()
-            ylim = hist_ax.get_ylim()
-            if density_threshold < xlim[1]:
-                hist_ax.axvline(density_threshold, linestyle='--', color='k')
-                hist_ax.text(density_threshold  + 0.02, ylim[1] * 0.95, 'filtering\nthreshold\n\n', va='top')
-            hist_ax.set_xlim(xlim)
-            hist_ax.set_xlabel('Mean distance to k nearest neighbors\n\n%d/%d (%.0f%%) spectra above threshold\nwere removed prior to clustering'%(sum(~density_filter), len(density_filter), 100*(~density_filter).mean()))
-            
-            ## Add colorbar
-            cbar_gs = gridspec.GridSpecFromSubplotSpec(8, 1, subplot_spec=hist_gs[1, 0],
-                                   wspace=0, hspace=0)
-            cbar_ax = fig.add_subplot(cbar_gs[4,0], xscale='linear', yscale='linear',
-                xlabel='', ylabel='', frameon=True, title='Euclidean Distance')
-            vmin = D.min().min()
-            vmax = D.max().max()
-            fig.colorbar(dist_im, cax=cbar_ax,
-            ticks=np.linspace(vmin, vmax, 3),
-            orientation='horizontal')
-            
-            
-            #hist_ax.hist(local_density.values, bins=np.linspace(0, 1, 50))
-            #hist_ax.yaxis.tick_right()            
+                hist_gs = gridspec.GridSpecFromSubplotSpec(3, 1, subplot_spec=gs[1, 3],
+                                       wspace=0, hspace=0)
 
-            fig.savefig(self.paths['clustering_plot']%(k, density_threshold_repl), dpi=250)
-            if close_clustergram_fig:
-                plt.close(fig)
-                
-        if build_ref:
-            self.build_reference(k, density_threshold)
+                hist_ax = fig.add_subplot(hist_gs[0,0], xscale='linear', yscale='linear',
+                    xlabel='', ylabel='', frameon=True, title='Local density histogram')
+                hist_ax.hist(local_density.values, bins=np.linspace(0, 1, 50))
+                hist_ax.yaxis.tick_right()
 
-        # Restore original cluster-index alignment after final GEP re-labeling.
-        qc_median_spectra = median_spectra.copy()
-        qc_median_spectra.index = reorder.index
+                xlim = hist_ax.get_xlim()
+                ylim = hist_ax.get_ylim()
+                if density_threshold < xlim[1]:
+                    hist_ax.axvline(density_threshold, linestyle='--', color='k')
+                    hist_ax.text(density_threshold  + 0.02, ylim[1] * 0.95, 'filtering\nthreshold\n\n', va='top')
+                hist_ax.set_xlim(xlim)
+                hist_ax.set_xlabel('Mean distance to k nearest neighbors\n\n%d/%d (%.0f%%) spectra above threshold\nwere removed prior to clustering'%(sum(~density_filter), len(density_filter), 100*(~density_filter).mean()))
 
-        run_qc(
-            output=os.path.join(self.output_dir, self.name, self.name),
-            prefix=f"k_{k}.dt_{density_threshold}".replace(".", "_"),
-            k=k,
-            reorder=reorder,
-            median_spectra=qc_median_spectra.sort_index(),
-            l2_spectra=l2_spectra,
-            local_density=local_density,
-            kmeans_cluster_labels=kmeans_cluster_labels,
-            normalized_counts=norm_counts.X,
-            refit_usages=density_filtered_refit_usages.values,
-            streaming=streaming,
-        )
-                
-                
+                ## Add colorbar
+                cbar_gs = gridspec.GridSpecFromSubplotSpec(8, 1, subplot_spec=hist_gs[1, 0],
+                                       wspace=0, hspace=0)
+                cbar_ax = fig.add_subplot(cbar_gs[4,0], xscale='linear', yscale='linear',
+                    xlabel='', ylabel='', frameon=True, title='Euclidean Distance')
+                vmin = D.min().min()
+                vmax = D.max().max()
+                fig.colorbar(dist_im, cax=cbar_ax,
+                ticks=np.linspace(vmin, vmax, 3),
+                orientation='horizontal')
+
+
+                #hist_ax.hist(local_density.values, bins=np.linspace(0, 1, 50))
+                #hist_ax.yaxis.tick_right()
+
+                fig.savefig(self.paths['clustering_plot']%(k, density_threshold_repl), dpi=250)
+                if close_clustergram_fig:
+                    plt.close(fig)
+
+            if build_ref:
+                self.build_reference(k, density_threshold)
+
+            # Restore original cluster-index alignment after final GEP re-labeling.
+            qc_median_spectra = median_spectra.copy()
+            qc_median_spectra.index = reorder.index
+
+            run_qc(
+                output=os.path.join(self.output_dir, self.name, self.name),
+                prefix=f"k_{k}.dt_{density_threshold}".replace(".", "_"),
+                k=k,
+                reorder=reorder,
+                median_spectra=qc_median_spectra.sort_index(),
+                l2_spectra=l2_spectra,
+                local_density=local_density,
+                kmeans_cluster_labels=kmeans_cluster_labels,
+                normalized_counts=norm_counts.X,
+                refit_usages=density_filtered_refit_usages.values,
+                streaming=streaming,
+            )
+
+
     def build_reference(self, k, density_threshold=0.5, target_sum=1e6):
         '''
         Builds reference GEPs for use with starCAT using the results from "consensus" step. 
@@ -1192,46 +1224,18 @@ class cNMF():
         save_df_to_text(ref_spectra, self.paths['starcat_spectra__txt']%(k, density_threshold_repl))
 
 
-    def k_selection_plot(self, close_fig=False):
+    def k_selection_plot(self, close_fig=False, streaming=False, normalized_counts_fn=None):
         '''
         Borrowed from Alexandrov Et Al. 2013 Deciphering Mutational Signatures
         publication in Cell Reports
+
+        streaming uses backed HVG expression and FP64 CPU CD refits.
+        normalized_counts_fn optionally selects a prepared normalized HVG
+        H5AD for evaluating pooled spectra; it must have matching gene order.
         '''
-        run_params = load_df_from_npz(self.paths['nmf_replicate_parameters'])
-        stats = []
-        norm_counts = sc.read(self.paths['normalized_counts'])
-        for k in sorted(set(run_params.n_components)):
-            stats.append(self.consensus(k, skip_density_and_return_after_stats=True,
-                                        show_clustering=False, close_clustergram_fig=True,
-                                        norm_counts=norm_counts).stats)
-
-        stats = pd.DataFrame(stats)
-        stats.reset_index(drop = True, inplace = True)
-
-        save_df_to_npz(stats, self.paths['k_selection_stats'])
-
-        fig = plt.figure(figsize=(6, 4))
-        ax1 = fig.add_subplot(111)
-        ax2 = ax1.twinx()
-
-
-        ax1.plot(stats.k, stats.silhouette, 'o-', color='b')
-        ax1.set_ylabel('Stability', color='b', fontsize=15)
-        for tl in ax1.get_yticklabels():
-            tl.set_color('b')
-        #ax1.set_xlabel('K', fontsize=15)
-
-        ax2.plot(stats.k, stats.prediction_error, 'o-', color='r')
-        ax2.set_ylabel('Error', color='r', fontsize=15)
-        for tl in ax2.get_yticklabels():
-            tl.set_color('r')
-
-        ax1.set_xlabel('Number of Components', fontsize=15)
-        ax1.grid('on')
-        plt.tight_layout()
-        fig.savefig(self.paths['k_selection_plot'], dpi=250)
-        if close_fig:
-            plt.close(fig)
+        from cnmf.k_selection import k_selection_plot
+        k_selection_plot(self, close_fig=close_fig, streaming=streaming,
+                         normalized_counts_fn=normalized_counts_fn)
             
             
     def load_results(self, K, density_threshold, n_top_genes=100, norm_usage = True):
@@ -1347,7 +1351,8 @@ def main():
     parser.add_argument('--local-neighborhood-size', type=float, help='[consensus] Fraction of the number of replicates to use as nearest neighbors for local density filtering', default=0.30)
     parser.add_argument('--show-clustering', dest='show_clustering', help='[consensus] Produce a clustergram figure summarizing the spectra clustering', action='store_true')
     parser.add_argument('--build-reference', dest='build_reference', help='[consensus] Generates a reference spectra for use in starCAT', action='store_true', default=True)
-    parser.add_argument('--streaming', action='store_true', help='[consensus, CPU CD] Stream refit calculations; input loading and QC are not yet streaming')
+    parser.add_argument('--streaming', action='store_true', help='[prepare/consensus/k_selection_plot] Stream H5AD prepare with --genes-file, or CPU CD consensus/K-selection; usages remain in memory')
+    parser.add_argument('--k-selection-counts', type=str, help='[k_selection_plot] Prepared normalized HVG H5AD for evaluating combined spectra; defaults to this run\'s normalized counts, not raw counts')
 
     
     parser.add_argument("--engine", type=str.lower, choices=["cpu", "gpu"], help="[factorize,consensus] NMF engine to use (default cpu)", default="cpu")
@@ -1381,7 +1386,8 @@ def main():
     elif args.command == 'prepare':
         cnmf_obj.prepare(args.counts, components=args.components, n_iter=args.n_iter, densify=args.densify,
                          tpm_fn=args.tpm, seed=args.seed, beta_loss=args.beta_loss, max_NMF_iter=args.max_nmf_iter,
-                         num_highvar_genes=args.numgenes, genes_file=args.genes_file, init=args.init)
+                         num_highvar_genes=args.numgenes, genes_file=args.genes_file, init=args.init,
+                         streaming=args.streaming)
 
     elif args.command == 'factorize':
         cnmf_obj.factorize(worker_i=args.worker_index, total_workers=args.total_workers,
@@ -1407,7 +1413,8 @@ def main():
                                streaming=args.streaming)
 
     elif args.command == 'k_selection_plot':
-        cnmf_obj.k_selection_plot(close_fig=True)
+        cnmf_obj.k_selection_plot(close_fig=True, streaming=args.streaming,
+                                 normalized_counts_fn=args.k_selection_counts)
 
 
 if __name__=="__main__":
