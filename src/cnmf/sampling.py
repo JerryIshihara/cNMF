@@ -291,12 +291,15 @@ def _sample_export(data, indices, filename, chunk_size, memory_budget=None):
 
 
 def _sample_hvgs(data, output_dir, sample_prefix, sample_numgenes=2000,
-                 sample_hvg_mode='auto', sample_hvg_chunk_size=None, memory_budget=None):
-    """Save one ordered full-input HVG list for every draw's prepare step.
+                 sample_hvg_mode='auto', sample_hvg_chunk_size=None, memory_budget=None,
+                 tpm=None):
+    """Save an ordered HVG list for the supplied cells and genes.
 
     Reuse an existing mask in auto mode. Otherwise normalize temporary row
     chunks with cNMF's compute_tpm and accumulate population mean/variance,
     then apply the same Fano ranking used by cNMF's sparse HVG calculation.
+    Optional TPM uses the same normalization as prepare instead of recomputing
+    it from counts (which may contain only corrected HVGs).
     Neither the input counts nor their annotations are modified.
     """
     if not isinstance(sample_numgenes, int) or sample_numgenes < 0:
@@ -322,29 +325,40 @@ def _sample_hvgs(data, output_dir, sample_prefix, sample_numgenes=2000,
         from sklearn.preprocessing import StandardScaler
         from .cnmf import compute_tpm, get_highvar_genes_from_stats
 
+        expression = data if tpm is None else tpm
+        columns = None
+        if tpm is not None:
+            columns = tpm.var_names.get_indexer(data.var_names)
+            if not data.obs_names.equals(tpm.obs_names) or (columns < 0).any():
+                raise ValueError('TPM must match count cells and contain every count gene')
         if sample_hvg_chunk_size is None:
             if memory_budget is None:
                 memory_budget = _sample_memory_budget()
-            sample_hvg_chunk_size = _sample_chunk_size(data.shape, data.X.dtype, memory_budget)
+            sample_hvg_chunk_size = _sample_chunk_size(expression.shape, expression.X.dtype, memory_budget)
             info['memory_budget_bytes'] = memory_budget
         print('Computing shared cNMF HVGs from all %d input cells (%d per chunk).'
               % (data.n_obs, sample_hvg_chunk_size))
         scaler = StandardScaler(with_mean=False)
         for start in range(0, data.n_obs, sample_hvg_chunk_size):
-            chunk = data.X[start:start + sample_hvg_chunk_size]
+            chunk = expression.X[start:start + sample_hvg_chunk_size]
+            if columns is not None:
+                chunk = chunk[:, columns]
             values = chunk.data if sparse.issparse(chunk) else chunk
             if not np.isfinite(values).all():
                 raise ValueError('HVG input contains NaN or Inf')
             if (values < 0).any():
                 raise ValueError('HVG selection requires nonnegative counts; use sample_numgenes=0 to skip')
-            tpm = compute_tpm(ad.AnnData(chunk))
-            scaler.partial_fit(tpm.X)
+            scaler.partial_fit(compute_tpm(ad.AnnData(chunk)).X if tpm is None else chunk)
         stats, _ = get_highvar_genes_from_stats(
             scaler.mean_, scaler.var_, numgenes=sample_numgenes)
-        selected = stats['high_var'].to_numpy()
+        # Fixed-size ranking can otherwise include constant genes when fewer
+        # than sample_numgenes vary. Their zero TPM std breaks consensus refits.
+        eligible = np.isfinite(scaler.var_) & (scaler.var_ > 0)
+        ranked = stats.loc[eligible, 'fano_ratio'].sort_values(ascending=False)
+        selected = stats.index.isin(ranked.index[:sample_numgenes])
         info.update(source='computed', method='cnmf_fano_ratio',
                     numgenes=sample_numgenes, chunk_size=sample_hvg_chunk_size,
-                    normalization='CPM (target_sum=1e6)',
+                    normalization='CPM (target_sum=1e6)' if tpm is None else 'provided TPM',
                     statistics_dtype='float64')
 
     genes = data.var_names[selected]

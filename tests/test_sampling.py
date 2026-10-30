@@ -532,6 +532,23 @@ def test_hvg_reads_only_chunks(tmp_path):
     np.testing.assert_array_equal(values, before)
 
 
+@pytest.mark.parametrize('with_tpm', [False, True])
+def test_recomputed_hvgs_exclude_constant_genes(tmp_path, with_tpm):
+    values = np.random.default_rng(61).poisson(3, (60, 12)).astype(float)
+    values[:, 0] = 0
+    data = ad.AnnData(sparse.csr_matrix(values))
+    tpm = None
+    if with_tpm:
+        tpm = compute_tpm(data)
+        expression = tpm.X.toarray()
+        expression[:, 1] = 5  # Counts vary, but the supplied TPM gene is constant.
+        tpm.X = sparse.csr_matrix(expression)
+    info = _sample_hvgs(data, tmp_path, 'sample', 20,
+                        sample_hvg_mode='recompute', sample_hvg_chunk_size=17, tpm=tpm)
+    genes = (tmp_path / info['genes_file']).read_text().splitlines()
+    assert genes == data.var_names[2 if with_tpm else 1:].tolist()
+
+
 def test_skip_hvg_calculation(counts, tmp_path, monkeypatch):
     def unexpected_calculation(*args, **kwargs):
         pytest.fail('sample_numgenes=0 must skip HVG calculation')
