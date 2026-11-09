@@ -48,7 +48,8 @@ setuptools.setup(
    'seaborn',
    'scipy',
    'tqdm',
-   'pyyaml'
+   'pyyaml',
+   'scsampler>=1.0.2'
    ],
     extras_require={
         # GPU NMF engine: PyTorch MU and sklearn-compatible Fast-HALS kernels.
