@@ -213,14 +213,20 @@ def run_qc(
     kmeans_cluster_labels,
     normalized_counts,
     refit_usages,
+    streaming=False,
 ):
     """Calculate and save QC using state already produced by ``consensus``."""
     # local_density contains all spectra, while l2_spectra has already been density-filtered.
     nruns = len(local_density)
     nruns_per_gep = nruns/k
-    if sp.issparse(normalized_counts):
-        normalized_counts = np.asarray(normalized_counts.todense())
-    run_r2, run_sse, run_tss = get_r2(
+    if streaming:
+        from cnmf.streaming import reconstruction_stats_streaming
+        reconstruction_stats = reconstruction_stats_streaming
+    else:
+        if sp.issparse(normalized_counts):
+            normalized_counts = np.asarray(normalized_counts.todense())
+        reconstruction_stats = get_r2
+    run_r2, run_sse, run_tss = reconstruction_stats(
         normalized_counts,
         refit_usages,
         median_spectra.values,
