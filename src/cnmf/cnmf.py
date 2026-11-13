@@ -991,7 +991,11 @@ class cNMF():
         density_filtered_refit_usages = rf_usages
         
         # Re-order usage by total contribution
-        norm_usages = rf_usages.div(rf_usages.sum(axis=1), axis=0)      
+        totals = rf_usages.sum(axis=1)
+        zero_cells = (totals == 0).sum()
+        if zero_cells > 0:
+            warnings.warn('consensus: %d cells have zero total usage; keeping their normalized usages at zero.' % zero_cells, UserWarning)
+        norm_usages = rf_usages.div(totals.replace(0, 1.0), axis=0)
         reorder = norm_usages.sum(axis=0).sort_values(ascending=False)
         rf_usages = rf_usages.loc[:, reorder.index]
         norm_usages = norm_usages.loc[:, reorder.index]
@@ -1271,7 +1275,11 @@ class cNMF():
         usage = pd.read_csv(usagefn, sep='\t', index_col=0)
         
         if norm_usage:
-            usage = usage.div(usage.sum(axis=1), axis=0)
+            totals = usage.sum(axis=1)
+            zero_cells = (totals == 0).sum()
+            if zero_cells > 0:
+                warnings.warn('load_results: %d cells have zero total usage; keeping their normalized usages at zero.' % zero_cells, UserWarning)
+            usage = usage.div(totals.replace(0, 1.0), axis=0)
         
         try:
             usage.columns = [int(x) for x in usage.columns]
